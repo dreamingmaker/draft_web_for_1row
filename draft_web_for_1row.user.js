@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.3.0
+// @version      0.3.1
 // @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually becomes one line.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.3.0';
+  const SCRIPT_VERSION = '0.3.1';
 
   const CONFIG = {
     maxPresses: 60,
@@ -45,11 +45,11 @@
   let currentRequestId = null;
   let lastDiagnosticText = '';
 
-  const handledRequests = new Set();
-  const handledDiagnosticRequests = new Set();
-  const listenedDocuments = new WeakSet();
-  const pendingTopRuns = new Map();
-  const pendingDiagnostics = new Map();
+  const handledRequests = createValueStore();
+  const handledDiagnosticRequests = createValueStore();
+  const listenedDocuments = createValueStore();
+  const pendingTopRuns = createKeyValueStore();
+  const pendingDiagnostics = createKeyValueStore();
 
   window.addEventListener('message', handleFrameMessage, false);
   registerSelectionListeners();
@@ -1454,12 +1454,12 @@
     });
   }
 
-  function collectReachableWindows(rootWin, result = [], seen = new Set()) {
-    if (seen.has(rootWin)) {
+  function collectReachableWindows(rootWin, result = [], seen = []) {
+    if (seen.indexOf(rootWin) !== -1) {
       return result;
     }
 
-    seen.add(rootWin);
+    seen.push(rootWin);
     result.push(rootWin);
 
     for (let index = 0; index < rootWin.frames.length; index += 1) {
@@ -1534,6 +1534,69 @@
 
     debug.hidden = true;
     debug.textContent = '';
+  }
+
+  function createValueStore() {
+    const values = [];
+
+    return {
+      has(value) {
+        return values.indexOf(value) !== -1;
+      },
+      add(value) {
+        if (values.indexOf(value) === -1) {
+          values.push(value);
+        }
+      },
+      delete(value) {
+        const index = values.indexOf(value);
+
+        if (index !== -1) {
+          values.splice(index, 1);
+        }
+      },
+    };
+  }
+
+  function createKeyValueStore() {
+    const entries = [];
+
+    return {
+      has(key) {
+        return findEntryIndex(entries, key) !== -1;
+      },
+      get(key) {
+        const index = findEntryIndex(entries, key);
+        return index === -1 ? undefined : entries[index].value;
+      },
+      set(key, value) {
+        const index = findEntryIndex(entries, key);
+
+        if (index === -1) {
+          entries.push({ key, value });
+          return;
+        }
+
+        entries[index].value = value;
+      },
+      delete(key) {
+        const index = findEntryIndex(entries, key);
+
+        if (index !== -1) {
+          entries.splice(index, 1);
+        }
+      },
+    };
+  }
+
+  function findEntryIndex(entries, key) {
+    for (let index = 0; index < entries.length; index += 1) {
+      if (entries[index].key === key) {
+        return index;
+      }
+    }
+
+    return -1;
   }
 
   function createRequestId() {
