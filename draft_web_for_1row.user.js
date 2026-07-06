@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.8.3
+// @version      0.8.4
 // @description  Adds fixed HWP letter-spacing buttons for selected text in a web draft editor.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.3';
+  const SCRIPT_VERSION = '0.8.4';
 
   const CONFIG = {
     maxPresses: 60,
@@ -193,14 +193,7 @@
 
     runButton.addEventListener('click', async () => {
       if (running) {
-        abortRequested = true;
-        broadcastToChildFrames({
-          source: SOURCE,
-          type: MESSAGE.abort,
-          requestId: currentRequestId,
-          instanceId: INSTANCE_ID,
-        });
-        setStatus('중지 중...');
+        requestAbort();
         return;
       }
 
@@ -227,7 +220,7 @@
 
     increaseButton.addEventListener('click', async () => {
       if (running) {
-        setStatus('실행 중에는 다른 작업을 시작하지 않습니다. 먼저 중지해 주세요.');
+        requestAbort();
         return;
       }
 
@@ -251,6 +244,18 @@
         increaseButton.textContent = '2칸 늘리기';
       }
     });
+  }
+
+  function requestAbort() {
+    abortRequested = true;
+    broadcastToChildFrames({
+      source: SOURCE,
+      type: MESSAGE.abort,
+      requestId: currentRequestId,
+      instanceId: INSTANCE_ID,
+    });
+    setStatus('중지 중...');
+    console.info('[draft-web-for-1row] abort requested');
   }
 
   async function runFixedHwpSpacingAction({ actionId, label, presses }) {
