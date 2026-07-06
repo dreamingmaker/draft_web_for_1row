@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.8.0
+// @version      0.8.1
 // @description  Adds fixed HWP letter-spacing buttons for selected text in a web draft editor.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.0';
+  const SCRIPT_VERSION = '0.8.1';
 
   const CONFIG = {
     maxPresses: 60,
@@ -274,7 +274,8 @@
       presses,
       actionId,
       debugLabel: label,
-      forceDebug: true,
+      forceDebug: false,
+      silentReport: true,
       stopOnLineChange: false,
     });
 
@@ -287,7 +288,7 @@
 
       lastDiagnosticText = text;
       setStatus(`${label} 실패`);
-      showDebug(text);
+      clearDebug();
       console.warn('[draft-web-for-1row] fixed HWP spacing action failed', result);
     }
   }
@@ -609,7 +610,7 @@
           stopOnLineChange,
         });
 
-        publishApiFallbackReport(report, requestId, `중지했습니다. HWP API ${applied}회 적용했습니다.`);
+        finishApiFallbackReport(report, requestId, `중지했습니다. HWP API ${applied}회 적용했습니다.`, options);
         return { applied: applied > 0, report };
       }
 
@@ -649,7 +650,7 @@
             stopOnLineChange,
           });
 
-          if (options.forceDebug || options.includeReachableFrames) {
+          if (!options.silentReport && (options.forceDebug || options.includeReachableFrames)) {
             publishApiFallbackReport(report, requestId, `HWP API 후보는 찾았지만 실행 실패: ${result.reason}`);
           }
 
@@ -682,10 +683,11 @@
         const beforeLabel = describeLineSignature(actionRecord.before);
         const afterLabel = describeLineSignature(actionRecord.after);
 
-        publishApiFallbackReport(
+        finishApiFallbackReport(
           report,
           requestId,
           `줄 변화 감지: ${beforeLabel} -> ${afterLabel}. HWP API ${applied}회에서 멈췄습니다.`,
+          options,
         );
 
         return { applied: true, report, stoppedByLineChange: true };
@@ -705,7 +707,7 @@
     });
     const message = `HWP API로 ${actionName} ${applied}회 적용했습니다.`;
 
-    publishApiFallbackReport(report, requestId, message, options.forceDebug);
+    finishApiFallbackReport(report, requestId, message, options);
 
     return { applied: applied > 0, report };
   }
@@ -810,6 +812,26 @@
     console.log(report.data);
     console.log(report.text);
     console.groupEnd();
+  }
+
+  function finishApiFallbackReport(report, requestId, statusMessage, options = {}) {
+    if (options.silentReport) {
+      lastDiagnosticText = report.text;
+      setStatus(statusMessage, {
+        requestId,
+        found: true,
+        terminal: true,
+      });
+      clearDebug();
+
+      console.groupCollapsed('[draft-web-for-1row] HWP API action report');
+      console.log(report.data);
+      console.log(report.text);
+      console.groupEnd();
+      return;
+    }
+
+    publishApiFallbackReport(report, requestId, statusMessage);
   }
 
   function getHwpLayoutObservation(controller, options = {}) {
