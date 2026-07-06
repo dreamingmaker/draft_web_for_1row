@@ -47,8 +47,9 @@ GitLab에서 push를 거부했습니다.
 확인할 것:
 - 토큰에 write_repository 권한이 있는지 확인하세요.
 - 토큰 주인이 이 프로젝트의 Developer 또는 Maintainer 이상인지 확인하세요.
-- main 브랜치가 보호 브랜치라면 Maintainer만 push 가능할 수 있습니다.
+- main 브랜치가 보호 브랜치라면 push 허용 대상이 제한되어 있을 수 있습니다.
 - 권한이 애매하면 GitLab 프로젝트의 Settings > Repository > Protected branches를 확인하세요.
+- force push는 기본으로 사용하지 않습니다. 그래도 막히면 main 브랜치의 Allowed to push 설정을 확인하세요.
 
 이 문제는 로컬 스크립트가 아니라 GitLab 서버 권한 설정에서 해결해야 합니다.
 HELP
@@ -76,11 +77,21 @@ printf '%s\n' "${fetch_output}" >&2
 
 echo "GitLab ${target_branch} 브랜치로 푸시합니다..." >&2
 push_output="$(GIT_ASKPASS="${askpass_file}" GIT_TERMINAL_PROMPT=0 \
-  git push --force-with-lease "${remote_name}" "${local_branch}:${target_branch}" 2>&1)" || {
+  git push "${remote_name}" "${local_branch}:${target_branch}" 2>&1)" || {
   printf '%s\n' "${push_output}" >&2
 
-  if printf '%s\n' "${push_output}" | grep -qiE 'not allowed to push|403|protected branch'; then
+  if printf '%s\n' "${push_output}" | grep -qiE 'not allowed to push|403|protected branch|pre-receive hook declined'; then
     print_push_permission_help
+  elif printf '%s\n' "${push_output}" | grep -qiE 'non-fast-forward|fetch first|failed to push some refs'; then
+    cat >&2 <<HELP
+
+GitLab 원격 브랜치와 로컬 히스토리가 맞지 않아 일반 push가 거부되었습니다.
+먼저 GitLab 원격을 fetch한 뒤 원격 main을 로컬 main에 병합해야 합니다.
+
+  git fetch ${remote_name} ${target_branch}
+  git merge --allow-unrelated-histories -s ours ${remote_name}/${target_branch}
+  ./push_gitlab.sh
+HELP
   fi
 
   exit 1
