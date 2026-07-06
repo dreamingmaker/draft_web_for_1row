@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.7.0
-// @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually uses one fewer line.
+// @version      0.8.0
+// @description  Adds fixed HWP letter-spacing buttons for selected text in a web draft editor.
 // @match        *://*/*
 // @include      about:blank
 // @include      about:srcdoc
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.7.0';
+  const SCRIPT_VERSION = '0.8.0';
 
   const CONFIG = {
     maxPresses: 60,
@@ -24,6 +24,7 @@
     overallWaitMs: 16000,
     diagnoseWaitMs: 1800,
     apiFallbackPresses: 4,
+    apiExpandPresses: 2,
     apiDebugPresses: 1,
     apiFallbackDelayMs: 70,
     stopApiFallbackOnLineChange: true,
@@ -114,30 +115,12 @@
         background: #1e40af;
       }
 
-      #${UI_ID} button.secondary {
-        min-width: 62px;
-        background: #374151;
-      }
-
-      #${UI_ID} button.secondary:hover {
-        background: #1f2937;
-      }
-
-      #${UI_ID} button.debug-once {
-        min-width: 48px;
-        background: #6d28d9;
-      }
-
-      #${UI_ID} button.debug-once:hover {
-        background: #5b21b6;
-      }
-
-      #${UI_ID} button.copy {
-        min-width: 54px;
+      #${UI_ID} button.increase {
+        min-width: 96px;
         background: #166534;
       }
 
-      #${UI_ID} button.copy:hover {
+      #${UI_ID} button.increase:hover {
         background: #14532d;
       }
 
@@ -196,32 +179,20 @@
 
     const runButton = document.createElement('button');
     runButton.type = 'button';
-    runButton.textContent = '한 줄 줄이기';
-    runButton.title = '선택한 텍스트가 현재보다 한 줄 덜 차지하도록 자간을 줄입니다.';
+    runButton.textContent = '4칸 단축';
+    runButton.title = '선택한 텍스트의 자간을 4칸 좁힙니다.';
 
-    const debugOnceButton = document.createElement('button');
-    debugOnceButton.type = 'button';
-    debugOnceButton.className = 'debug-once';
-    debugOnceButton.textContent = '1회';
-    debugOnceButton.title = 'HWP API 자간 좁히기 액션을 한 번만 실행하고 로그를 남깁니다.';
-
-    const diagnoseButton = document.createElement('button');
-    diagnoseButton.type = 'button';
-    diagnoseButton.className = 'secondary';
-    diagnoseButton.textContent = '진단';
-    diagnoseButton.title = 'iframe, 선택 영역, activeElement 상태를 진단합니다.';
-
-    const copyButton = document.createElement('button');
-    copyButton.type = 'button';
-    copyButton.className = 'copy';
-    copyButton.textContent = '복사';
-    copyButton.title = '마지막 진단 결과를 클립보드에 복사합니다.';
+    const increaseButton = document.createElement('button');
+    increaseButton.type = 'button';
+    increaseButton.className = 'increase';
+    increaseButton.textContent = '2칸 늘리기';
+    increaseButton.title = '선택한 텍스트의 자간을 2칸 넓힙니다.';
 
     const debug = document.createElement('pre');
     debug.className = 'debug';
     debug.hidden = true;
 
-    actions.append(runButton, debugOnceButton, diagnoseButton, copyButton);
+    actions.append(runButton, increaseButton);
 
     panel.append(status, actions, debug);
     document.documentElement.append(style, panel);
@@ -247,35 +218,78 @@
       runButton.textContent = '중지';
 
       try {
-        await requestOneLineFromAllFrames();
+        await runFixedHwpSpacingAction({
+          button: runButton,
+          actionId: 'CharShapeSpacingDecrease',
+          label: '4칸 단축',
+          presses: CONFIG.apiFallbackPresses,
+        });
       } finally {
         running = false;
         abortRequested = false;
         currentRequestId = null;
         runButton.dataset.running = 'false';
-        runButton.textContent = '한 줄 줄이기';
+        runButton.textContent = '4칸 단축';
       }
     });
 
-    debugOnceButton.addEventListener('click', async () => {
+    increaseButton.addEventListener('click', async () => {
       if (running) {
-        setStatus('실행 중에는 1회 테스트를 시작하지 않습니다. 먼저 중지해 주세요.');
+        setStatus('실행 중에는 다른 작업을 시작하지 않습니다. 먼저 중지해 주세요.');
         return;
       }
 
-      await runHwpApiDebugPress();
-    });
+      running = true;
+      abortRequested = false;
+      increaseButton.dataset.running = 'true';
+      increaseButton.textContent = '중지';
 
-    diagnoseButton.addEventListener('click', async () => {
-      if (running) {
-        setStatus('실행 중에는 진단을 시작하지 않습니다. 먼저 중지해 주세요.');
-        return;
+      try {
+        await runFixedHwpSpacingAction({
+          button: increaseButton,
+          actionId: 'CharShapeSpacingIncrease',
+          label: '2칸 늘리기',
+          presses: CONFIG.apiExpandPresses,
+        });
+      } finally {
+        running = false;
+        abortRequested = false;
+        currentRequestId = null;
+        increaseButton.dataset.running = 'false';
+        increaseButton.textContent = '2칸 늘리기';
       }
+    });
+  }
 
-      await runDiagnostic();
+  async function runFixedHwpSpacingAction({ actionId, label, presses }) {
+    const requestId = createRequestId();
+    currentRequestId = requestId;
+
+    clearDebug();
+    setStatus(`${label} 실행 중...`);
+
+    const result = await applyHwpApiFallback(requestId, {
+      includeReachableFrames: true,
+      silentNoSelection: true,
+      presses,
+      actionId,
+      debugLabel: label,
+      forceDebug: true,
+      stopOnLineChange: false,
     });
 
-    copyButton.addEventListener('click', copyLastDiagnostic);
+    if (!result.applied) {
+      const text = [
+        `${label} 실패`,
+        `- 이유: ${result.reason || 'candidate-not-found'}`,
+        '- HWP API 후보를 찾지 못했거나 실행이 실패했습니다.',
+      ].join('\n');
+
+      lastDiagnosticText = text;
+      setStatus(`${label} 실패`);
+      showDebug(text);
+      console.warn('[draft-web-for-1row] fixed HWP spacing action failed', result);
+    }
   }
 
   function requestOneLineFromAllFrames() {
@@ -558,6 +572,11 @@
   async function applyHwpApiFallback(requestId, options = {}) {
     const target = findBestHwpActionTarget(options);
     const presses = normalizePressCount(options.presses, CONFIG.apiFallbackPresses);
+    const actionId = options.actionId || 'CharShapeSpacingDecrease';
+    const actionName = actionId === 'CharShapeSpacingIncrease' ? '자간 넓히기' : '자간 좁히기';
+    const stopOnLineChange = options.stopOnLineChange !== undefined
+      ? Boolean(options.stopOnLineChange)
+      : CONFIG.stopApiFallbackOnLineChange;
     const label = options.debugLabel || 'HWP API fallback';
     const startedAt = Date.now();
     const actionResults = [];
@@ -571,7 +590,7 @@
     }
 
     let applied = 0;
-    setStatus(`DOM 선택은 보이지 않습니다. HWP API로 자간 좁히기 ${presses}회 시도 중...`, {
+    setStatus(`HWP API로 ${actionName} ${presses}회 시도 중...`, {
       requestId,
       found: true,
     });
@@ -581,11 +600,13 @@
         const report = buildApiFallbackReport({
           label,
           target,
+          actionId,
           requestedPresses: presses,
           applied,
           actionResults,
           startedAt,
           stopped: true,
+          stopOnLineChange,
         });
 
         publishApiFallbackReport(report, requestId, `중지했습니다. HWP API ${applied}회 적용했습니다.`);
@@ -593,10 +614,10 @@
       }
 
       const beforeObservation = getHwpLayoutObservation(target.controller, {
-        includeSelectionSpan: true,
+        includeSelectionSpan: stopOnLineChange,
       });
       const actionStartedAt = Date.now();
-      const result = runHwpAction(target.controller, 'CharShapeSpacingDecrease');
+      const result = runHwpAction(target.controller, actionId);
       const actionRecord = {
         index: index + 1,
         elapsedMs: Date.now() - actionStartedAt,
@@ -619,11 +640,13 @@
           const report = buildApiFallbackReport({
             label,
             target,
+            actionId,
             requestedPresses: presses,
             applied,
             actionResults,
             startedAt,
             failure: result.reason,
+            stopOnLineChange,
           });
 
           if (options.forceDebug || options.includeReachableFrames) {
@@ -640,19 +663,21 @@
       await sleep(CONFIG.apiFallbackDelayMs);
 
       actionRecord.after = getHwpLayoutObservation(target.controller, {
-        includeSelectionSpan: true,
+        includeSelectionSpan: stopOnLineChange,
       });
       actionRecord.lineChanged = didHwpLineChange(actionRecord.before, actionRecord.after);
 
-      if (CONFIG.stopApiFallbackOnLineChange && actionRecord.lineChanged) {
+      if (stopOnLineChange && actionRecord.lineChanged) {
         const report = buildApiFallbackReport({
           label,
           target,
+          actionId,
           requestedPresses: presses,
           applied,
           actionResults,
           startedAt,
           stopReason: 'line-changed',
+          stopOnLineChange,
         });
         const beforeLabel = describeLineSignature(actionRecord.before);
         const afterLabel = describeLineSignature(actionRecord.after);
@@ -670,13 +695,15 @@
     const report = buildApiFallbackReport({
       label,
       target,
+      actionId,
       requestedPresses: presses,
       applied,
       actionResults,
       startedAt,
       stopReason: null,
+      stopOnLineChange,
     });
-    const message = `HWP API로 자간 좁히기 ${applied}회 적용했습니다. DOM 줄 수는 확인하지 못했습니다.`;
+    const message = `HWP API로 ${actionName} ${applied}회 적용했습니다.`;
 
     publishApiFallbackReport(report, requestId, message, options.forceDebug);
 
@@ -696,6 +723,7 @@
   function buildApiFallbackReport({
     label,
     target,
+    actionId = 'CharShapeSpacingDecrease',
     requestedPresses,
     applied,
     actionResults,
@@ -703,7 +731,9 @@
     stopped = false,
     failure = null,
     stopReason = null,
+    stopOnLineChange = CONFIG.stopApiFallbackOnLineChange,
   }) {
+    const actionName = actionId === 'CharShapeSpacingIncrease' ? '자간 넓히기' : '자간 좁히기';
     const elapsedMs = Date.now() - startedAt;
     const okCount = actionResults.filter((result) => result.ok).length;
     const failCount = actionResults.length - okCount;
@@ -719,6 +749,7 @@
       : 0;
     const summaryLines = [
       label,
+      `- 액션: ${actionName} (${actionId})`,
       `- 요청 횟수: ${requestedPresses}`,
       `- 적용 횟수: ${applied}`,
       `- 실패 횟수: ${failCount}`,
@@ -732,14 +763,16 @@
       `- 중지됨: ${stopped ? 'Y' : 'N'}`,
       `- 중지 사유: ${stopReason || 'none'}`,
       `- 실패 사유: ${failure || 'none'}`,
-      CONFIG.stopApiFallbackOnLineChange
+      stopOnLineChange
         ? 'KeyIndicator 줄 값이 바뀌면 자동으로 멈춥니다. 관측 불가이면 설정 횟수만큼 실행합니다.'
-        : '자동 줄 변화 감지가 꺼져 있습니다. 설정 횟수만큼 실행합니다.',
+        : '고정 횟수 모드입니다. 설정 횟수만큼 실행합니다.',
     ];
     const data = {
       script: SOURCE,
       version: SCRIPT_VERSION,
       label,
+      actionId,
+      actionName,
       requestedPresses,
       applied,
       failCount,
@@ -749,6 +782,7 @@
       selectionSpanObservableCount,
       lineChangedCount,
       stopped,
+      stopOnLineChange,
       stopReason,
       failure,
       target: target.description,
@@ -2137,7 +2171,7 @@
     }
 
     if (info.focusedHwpControllerTotal > 0) {
-      hints.push('포커스된 HWP API 후보가 있습니다. 한 줄 줄이기 버튼이 API fallback을 시도합니다.');
+      hints.push('포커스된 HWP API 후보가 있습니다. 4칸 단축/2칸 늘리기 버튼이 HWP API를 실행합니다.');
     }
 
     if (info.layoutObservableHwpTotal > 0) {
