@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.8.2
+// @version      0.8.3
 // @description  Adds fixed HWP letter-spacing buttons for selected text in a web draft editor.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.2';
+  const SCRIPT_VERSION = '0.8.3';
 
   const CONFIG = {
     maxPresses: 60,
@@ -268,7 +268,7 @@
       debugLabel: label,
       forceDebug: false,
       silentReport: true,
-      stopOnLineChange: false,
+      stopOnLineChange: CONFIG.stopApiFallbackOnLineChange,
     });
 
     if (!result.applied) {
