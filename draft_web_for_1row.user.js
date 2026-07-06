@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.8.1
+// @version      0.8.2
 // @description  Adds fixed HWP letter-spacing buttons for selected text in a web draft editor.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.1';
+  const SCRIPT_VERSION = '0.8.2';
 
   const CONFIG = {
     maxPresses: 60,
@@ -129,17 +129,7 @@
       }
 
       #${UI_ID} .status {
-        max-width: 300px;
-        padding: 5px 8px;
-        border: 1px solid rgba(0, 0, 0, 0.14);
-        border-radius: 6px;
-        background: rgba(255, 255, 255, 0.96);
-        color: #111827;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
-        font-size: 12px;
-        line-height: 1.35;
-        text-align: right;
-        white-space: normal;
+        display: none;
       }
 
       #${UI_ID} .debug {
@@ -172,6 +162,8 @@
 
     const status = document.createElement('div');
     status.className = 'status';
+    status.hidden = true;
+    status.setAttribute('aria-hidden', 'true');
     status.textContent = '텍스트를 드래그한 뒤 누르세요.';
 
     const actions = document.createElement('div');
