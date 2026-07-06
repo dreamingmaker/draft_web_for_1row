@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.1.0
+// @version      0.2.0
 // @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually becomes one line.
 // @match        *://*/*
 // @run-at       document-idle
@@ -15,48 +15,51 @@
     maxPresses: 60,
     settleMs: 80,
     stalledLimit: 8,
+    requestWaitMs: 1200,
+    overallWaitMs: 16000,
     minRectWidth: 1,
     minRectHeight: 1,
     lineTolerancePx: 2,
   };
 
-  const ID = 'draft-web-for-1row-panel';
-
-  // Same-origin frames are handled by the top window. Cross-origin frames need
-  // their own copy because the parent page cannot inspect their selections.
-  if (isSameOriginChildFrame()) {
-    return;
-  }
+  const UI_ID = 'draft-web-for-1row-panel';
+  const SOURCE = 'draft-web-for-1row';
+  const MESSAGE = {
+    run: 'run',
+    abort: 'abort',
+    status: 'status',
+  };
+  const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
   let lastSelection = null;
   let running = false;
   let abortRequested = false;
-  const listenedDocuments = new WeakSet();
+  let currentRequestId = null;
 
-  createPanel();
+  const handledRequests = new Set();
+  const listenedDocuments = new WeakSet();
+  const pendingTopRuns = new Map();
+
+  window.addEventListener('message', handleFrameMessage, false);
   registerSelectionListeners();
   setInterval(registerSelectionListeners, 1500);
 
-  function isSameOriginChildFrame() {
-    if (window.top === window) {
-      return false;
-    }
+  if (isTopFrame()) {
+    createPanel();
+  }
 
-    try {
-      return Boolean(window.top.document);
-    } catch (_error) {
-      return false;
-    }
+  function isTopFrame() {
+    return window.parent === window;
   }
 
   function createPanel() {
-    if (document.getElementById(ID)) {
+    if (document.getElementById(UI_ID)) {
       return;
     }
 
     const style = document.createElement('style');
     style.textContent = `
-      #${ID} {
+      #${UI_ID} {
         position: fixed;
         right: 18px;
         bottom: 18px;
@@ -69,7 +72,7 @@
         user-select: none;
       }
 
-      #${ID} button {
+      #${UI_ID} button {
         min-width: 118px;
         height: 36px;
         padding: 0 13px;
@@ -85,16 +88,16 @@
         white-space: nowrap;
       }
 
-      #${ID} button:hover {
+      #${UI_ID} button:hover {
         background: #1e40af;
       }
 
-      #${ID} button[data-running="true"] {
+      #${UI_ID} button[data-running="true"] {
         background: #9f1239;
       }
 
-      #${ID} .status {
-        max-width: 260px;
+      #${UI_ID} .status {
+        max-width: 300px;
         padding: 5px 8px;
         border: 1px solid rgba(0, 0, 0, 0.14);
         border-radius: 6px;
@@ -109,7 +112,7 @@
     `;
 
     const panel = document.createElement('div');
-    panel.id = ID;
+    panel.id = UI_ID;
 
     const status = document.createElement('div');
     status.className = 'status';
@@ -128,6 +131,12 @@
     button.addEventListener('click', async () => {
       if (running) {
         abortRequested = true;
+        broadcastToChildFrames({
+          source: SOURCE,
+          type: MESSAGE.abort,
+          requestId: currentRequestId,
+          instanceId: INSTANCE_ID,
+        });
         setStatus('중지 중...');
         return;
       }
@@ -138,63 +147,152 @@
       button.textContent = '중지';
 
       try {
-        await makeSelectedTextOneLine();
+        await requestOneLineFromAllFrames();
       } finally {
         running = false;
         abortRequested = false;
+        currentRequestId = null;
         button.dataset.running = 'false';
         button.textContent = '1줄로 만들기';
       }
     });
   }
 
-  async function makeSelectedTextOneLine() {
-    const selected = getCurrentSelection() || restoreLastSelection();
+  function requestOneLineFromAllFrames() {
+    const requestId = createRequestId();
+    currentRequestId = requestId;
+    handledRequests.add(requestId);
+
+    setStatus(`선택 영역 찾는 중... iframe ${window.frames.length}개 확인`);
+
+    broadcastToChildFrames({
+      source: SOURCE,
+      type: MESSAGE.run,
+      requestId,
+      instanceId: INSTANCE_ID,
+    });
+
+    return new Promise((resolve) => {
+      const pending = {
+        claimed: false,
+        resolved: false,
+        resolve,
+        waitTimer: null,
+        overallTimer: null,
+      };
+
+      pendingTopRuns.set(requestId, pending);
+
+      pending.waitTimer = setTimeout(async () => {
+        if (pending.claimed || pending.resolved) {
+          return;
+        }
+
+        const fallback = await makeSelectedTextOneLine(requestId, {
+          includeReachableFrames: true,
+          silentNoSelection: true,
+        });
+
+        if (fallback.found) {
+          markPendingClaimed(requestId);
+
+          if (fallback.terminal) {
+            finishPendingRun(requestId);
+          }
+
+          return;
+        }
+
+        setStatus(`선택 영역을 찾지 못했습니다. iframe ${window.frames.length}개 안쪽 선택 영역을 아직 못 보고 있습니다.`);
+        finishPendingRun(requestId);
+      }, CONFIG.requestWaitMs);
+
+      pending.overallTimer = setTimeout(() => {
+        const current = pendingTopRuns.get(requestId);
+
+        if (!current || current.resolved) {
+          return;
+        }
+
+        setStatus('작업 응답이 끊겼습니다. 다시 시도해 주세요.');
+        finishPendingRun(requestId);
+      }, CONFIG.overallWaitMs);
+
+      makeSelectedTextOneLine(requestId, {
+        includeReachableFrames: false,
+        silentNoSelection: true,
+      })
+        .then((result) => {
+          if (!pendingTopRuns.has(requestId) || !result.found) {
+            return;
+          }
+
+          markPendingClaimed(requestId);
+
+          if (result.terminal) {
+            finishPendingRun(requestId);
+          }
+        })
+        .catch((error) => {
+          console.error('[draft-web-for-1row] failed to process top selection', error);
+          setStatus('오류가 발생했습니다. 콘솔 로그를 확인해 주세요.');
+          finishPendingRun(requestId);
+        });
+    });
+  }
+
+  async function makeSelectedTextOneLine(requestId, options = {}) {
+    const selected = getCurrentSelection(options) || restoreLastSelection(options);
 
     if (!selected) {
-      setStatus('선택 영역을 찾지 못했습니다.');
-      return;
+      if (!options.silentNoSelection) {
+        setStatus('선택 영역을 찾지 못했습니다.', { requestId, found: false, terminal: true });
+      }
+
+      return { found: false, terminal: true };
     }
 
     rememberSelection(selected.win);
     let lines = countSelectionLines(selected.range);
 
     if (lines <= 0) {
-      setStatus('선택 영역의 줄 수를 읽지 못했습니다.');
-      return;
+      setStatus('선택 영역의 줄 수를 읽지 못했습니다.', { requestId, found: true, terminal: true });
+      return { found: true, terminal: true };
     }
 
     if (lines <= 1) {
-      setStatus('이미 1줄입니다.');
-      return;
+      setStatus('이미 1줄입니다.', { requestId, found: true, terminal: true });
+      return { found: true, terminal: true };
     }
+
+    setStatus(`선택 영역 확인: ${lines}줄`, { requestId, found: true });
 
     let previousSignature = getRangeSignature(selected.range);
     let stalledCount = 0;
 
     for (let pressCount = 1; pressCount <= CONFIG.maxPresses; pressCount += 1) {
       if (abortRequested) {
-        setStatus(`중지했습니다. 현재 ${lines}줄입니다.`);
-        return;
+        setStatus(`중지했습니다. 현재 ${lines}줄입니다.`, { requestId, found: true, terminal: true });
+        return { found: true, terminal: true };
       }
 
-      const activeSelection = getCurrentSelection() || restoreLastSelection();
+      const activeSelection = getCurrentSelection(options) || restoreLastSelection(options);
 
       if (!activeSelection) {
-        setStatus('반복 중 선택 영역이 사라졌습니다.');
-        return;
+        setStatus('반복 중 선택 영역이 사라졌습니다.', { requestId, found: true, terminal: true });
+        return { found: true, terminal: true };
       }
 
       dispatchAltShiftN(activeSelection);
       await sleep(CONFIG.settleMs);
 
-      const nextSelection = getCurrentSelection() || activeSelection;
+      const nextSelection = getCurrentSelection(options) || activeSelection;
       rememberSelection(nextSelection.win);
       lines = countSelectionLines(nextSelection.range);
 
       if (lines <= 1) {
-        setStatus(`완료: ${pressCount}회 적용했습니다.`);
-        return;
+        setStatus(`완료: ${pressCount}회 적용했습니다.`, { requestId, found: true, terminal: true });
+        return { found: true, terminal: true };
       }
 
       const nextSignature = getRangeSignature(nextSelection.range);
@@ -206,15 +304,139 @@
         previousSignature = nextSignature;
       }
 
-      setStatus(`조정 중: ${lines}줄, ${pressCount}회 적용`);
+      setStatus(`조정 중: ${lines}줄, ${pressCount}회 적용`, { requestId, found: true });
 
       if (stalledCount >= CONFIG.stalledLimit) {
-        setStatus('단축키 반응이 없거나 더 줄어들지 않습니다.');
-        return;
+        setStatus('단축키 반응이 없거나 더 줄어들지 않습니다.', { requestId, found: true, terminal: true });
+        return { found: true, terminal: true };
       }
     }
 
-    setStatus(`최대 ${CONFIG.maxPresses}회까지 적용했지만 ${lines}줄입니다.`);
+    setStatus(`최대 ${CONFIG.maxPresses}회까지 적용했지만 ${lines}줄입니다.`, { requestId, found: true, terminal: true });
+    return { found: true, terminal: true };
+  }
+
+  function handleFrameMessage(event) {
+    const message = event.data;
+
+    if (!message || message.source !== SOURCE || message.instanceId === INSTANCE_ID) {
+      return;
+    }
+
+    if (message.type === MESSAGE.run) {
+      handleRunMessage(message);
+      return;
+    }
+
+    if (message.type === MESSAGE.abort) {
+      handleAbortMessage(message);
+      return;
+    }
+
+    if (message.type === MESSAGE.status) {
+      handleStatusMessage(message);
+    }
+  }
+
+  function handleRunMessage(message) {
+    if (!message.requestId || handledRequests.has(message.requestId)) {
+      return;
+    }
+
+    handledRequests.add(message.requestId);
+    broadcastToChildFrames(message);
+
+    if (running) {
+      return;
+    }
+
+    running = true;
+    abortRequested = false;
+    currentRequestId = message.requestId;
+
+    makeSelectedTextOneLine(message.requestId, {
+      includeReachableFrames: false,
+      silentNoSelection: true,
+    })
+      .catch((error) => {
+        console.error('[draft-web-for-1row] failed to process frame selection', error);
+        setStatus('iframe 안쪽 처리 중 오류가 발생했습니다.', {
+          requestId: message.requestId,
+          found: true,
+          terminal: true,
+        });
+      })
+      .finally(() => {
+        running = false;
+        abortRequested = false;
+        currentRequestId = null;
+      });
+  }
+
+  function handleAbortMessage(message) {
+    if (message.requestId && message.requestId === currentRequestId) {
+      abortRequested = true;
+    }
+
+    broadcastToChildFrames(message);
+  }
+
+  function handleStatusMessage(message) {
+    if (!isTopFrame()) {
+      window.parent.postMessage(message, '*');
+      return;
+    }
+
+    const pending = pendingTopRuns.get(message.requestId);
+
+    if (!pending || pending.resolved) {
+      return;
+    }
+
+    if (message.found !== false) {
+      markPendingClaimed(message.requestId);
+    }
+
+    setStatus(message.message);
+
+    if (message.terminal) {
+      finishPendingRun(message.requestId);
+    }
+  }
+
+  function markPendingClaimed(requestId) {
+    const pending = pendingTopRuns.get(requestId);
+
+    if (!pending || pending.claimed) {
+      return;
+    }
+
+    pending.claimed = true;
+    clearTimeout(pending.waitTimer);
+  }
+
+  function finishPendingRun(requestId) {
+    const pending = pendingTopRuns.get(requestId);
+
+    if (!pending || pending.resolved) {
+      return;
+    }
+
+    pending.resolved = true;
+    clearTimeout(pending.waitTimer);
+    clearTimeout(pending.overallTimer);
+    pendingTopRuns.delete(requestId);
+    pending.resolve();
+  }
+
+  function broadcastToChildFrames(message) {
+    for (let index = 0; index < window.frames.length; index += 1) {
+      try {
+        window.frames[index].postMessage(message, '*');
+      } catch (_error) {
+        // Some frames may disappear while the broadcast is in progress.
+      }
+    }
   }
 
   function dispatchAltShiftN(selectionInfo) {
@@ -300,10 +522,24 @@
     return node;
   }
 
-  function getCurrentSelection() {
+  function getCurrentSelection(options = {}) {
+    const localSelection = getSelectionFromWindow(window);
+
+    if (localSelection) {
+      return localSelection;
+    }
+
+    if (!options.includeReachableFrames) {
+      return null;
+    }
+
     const windows = collectReachableWindows(window);
 
     for (const win of windows) {
+      if (win === window) {
+        continue;
+      }
+
       const selection = getSelectionFromWindow(win);
 
       if (selection) {
@@ -314,8 +550,12 @@
     return null;
   }
 
-  function restoreLastSelection() {
+  function restoreLastSelection(options = {}) {
     if (!lastSelection) {
+      return null;
+    }
+
+    if (!options.includeReachableFrames && lastSelection.win !== window) {
       return null;
     }
 
@@ -349,7 +589,10 @@
 
     lastSelection = {
       win,
-      ranges: Array.from({ length: selection.selection.rangeCount }, (_value, index) => selection.selection.getRangeAt(index).cloneRange()),
+      ranges: Array.from(
+        { length: selection.selection.rangeCount },
+        (_value, index) => selection.selection.getRangeAt(index).cloneRange(),
+      ),
     };
   }
 
@@ -477,13 +720,37 @@
     return result;
   }
 
-  function setStatus(message) {
-    const panel = document.getElementById(ID);
-    const status = panel ? panel.querySelector('.status') : null;
+  function setStatus(message, meta = {}) {
+    if (isTopFrame()) {
+      const panel = document.getElementById(UI_ID);
+      const status = panel ? panel.querySelector('.status') : null;
 
-    if (status) {
-      status.textContent = message;
+      if (status) {
+        status.textContent = message;
+      }
+
+      return;
     }
+
+    const requestId = meta.requestId || currentRequestId;
+
+    if (!requestId) {
+      return;
+    }
+
+    window.parent.postMessage({
+      source: SOURCE,
+      type: MESSAGE.status,
+      requestId,
+      message,
+      found: meta.found !== false,
+      terminal: Boolean(meta.terminal),
+      instanceId: INSTANCE_ID,
+    }, '*');
+  }
+
+  function createRequestId() {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   }
 
   function sleep(ms) {
