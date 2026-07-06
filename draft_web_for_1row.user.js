@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.3.1
+// @version      0.4.0
 // @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually becomes one line.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.3.1';
+  const SCRIPT_VERSION = '0.4.0';
 
   const CONFIG = {
     maxPresses: 60,
@@ -23,6 +23,8 @@
     requestWaitMs: 1200,
     overallWaitMs: 16000,
     diagnoseWaitMs: 1800,
+    apiFallbackPresses: 6,
+    apiFallbackDelayMs: 70,
     minRectWidth: 1,
     minRectHeight: 1,
     lineTolerancePx: 2,
@@ -407,6 +409,12 @@
     const selected = getCurrentSelection(options) || restoreLastSelection(options);
 
     if (!selected) {
+      const apiFallback = await applyHwpApiFallback(requestId, options);
+
+      if (apiFallback.applied) {
+        return { found: true, terminal: true };
+      }
+
       if (!options.silentNoSelection) {
         setStatus('선택 영역을 찾지 못했습니다.', { requestId, found: false, terminal: true });
       }
@@ -476,6 +484,62 @@
 
     setStatus(`최대 ${CONFIG.maxPresses}회까지 적용했지만 ${lines}줄입니다.`, { requestId, found: true, terminal: true });
     return { found: true, terminal: true };
+  }
+
+  async function applyHwpApiFallback(requestId, options = {}) {
+    const target = findBestHwpActionTarget(options);
+
+    if (!target) {
+      return { applied: false };
+    }
+
+    let applied = 0;
+    setStatus(`DOM 선택은 보이지 않습니다. HWP API로 자간 좁히기 ${CONFIG.apiFallbackPresses}회 시도 중...`, {
+      requestId,
+      found: true,
+    });
+
+    for (let index = 0; index < CONFIG.apiFallbackPresses; index += 1) {
+      if (abortRequested) {
+        setStatus(`중지했습니다. HWP API ${applied}회 적용했습니다.`, {
+          requestId,
+          found: true,
+          terminal: true,
+        });
+        return { applied: applied > 0 };
+      }
+
+      const result = runHwpAction(target.controller, 'CharShapeSpacingDecrease');
+
+      if (!result.ok) {
+        console.warn('[draft-web-for-1row] HWP action failed', {
+          target: target.description,
+          result,
+        });
+
+        if (applied === 0) {
+          setStatus(`HWP API 후보는 찾았지만 실행 실패: ${result.reason}`, {
+            requestId,
+            found: false,
+            terminal: true,
+          });
+          return { applied: false };
+        }
+
+        break;
+      }
+
+      applied += 1;
+      await sleep(CONFIG.apiFallbackDelayMs);
+    }
+
+    setStatus(`HWP API로 자간 좁히기 ${applied}회 적용했습니다. DOM 줄 수는 확인하지 못했습니다.`, {
+      requestId,
+      found: true,
+      terminal: true,
+    });
+
+    return { applied: applied > 0 };
   }
 
   function handleFrameMessage(event) {
@@ -729,6 +793,236 @@
     }
   }
 
+  function findBestHwpActionTarget(options = {}) {
+    const windows = options.includeReachableFrames ? collectReachableWindows(window) : [window];
+    const focused = [];
+    const focusedDelegating = [];
+    const fallback = [];
+
+    windows.forEach((win) => {
+      const focusDelegatedToIframe = isFocusDelegatingToChildFrame(win);
+
+      if (focusDelegatedToIframe && !options.includeReachableFrames) {
+        return;
+      }
+
+      const candidates = getHwpControllerCandidates(win);
+
+      candidates.forEach((candidate) => {
+        const item = {
+          controller: candidate.value,
+          description: describeHwpControllerCandidate(candidate),
+        };
+
+        if (safeDocumentHasFocus(win.document)) {
+          if (focusDelegatedToIframe) {
+            focusedDelegating.push(item);
+          } else {
+            focused.push(item);
+          }
+        } else {
+          fallback.push(item);
+        }
+      });
+    });
+
+    return focused[0] || focusedDelegating[0] || fallback[0] || null;
+  }
+
+  function getHwpControllerCandidates(win) {
+    const candidates = [];
+    const seen = createValueStore();
+
+    addKnownHwpControllerCandidates(win, candidates, seen);
+    addNamedHwpControllerCandidates(win, candidates, seen);
+    addDomHwpControllerCandidates(win, candidates, seen);
+
+    return candidates.filter((candidate) => isRunnableHwpController(candidate.value));
+  }
+
+  function addKnownHwpControllerCandidates(win, candidates, seen) {
+    [
+      'HwpCtrl',
+      'hwpCtrl',
+      'HwpCtrl1',
+      'hwpCtrl1',
+      'HwpObject',
+      'hwpObject',
+      'hwp',
+      'webHwp',
+      'WebHwp',
+    ].forEach((key) => {
+      addHwpCandidate(candidates, seen, getWindowValue(win, key), {
+        source: 'known-global',
+        key,
+        win,
+      });
+    });
+  }
+
+  function addNamedHwpControllerCandidates(win, candidates, seen) {
+    getWindowKeys(win).forEach((key) => {
+      if (!/hwp|webhwp|haction|hparameter/i.test(key)) {
+        return;
+      }
+
+      addHwpCandidate(candidates, seen, getWindowValue(win, key), {
+        source: 'named-global',
+        key,
+        win,
+      });
+    });
+  }
+
+  function addDomHwpControllerCandidates(win, candidates, seen) {
+    const elements = getPotentialHwpElements(win.document);
+
+    elements.forEach((element) => {
+      addHwpCandidate(candidates, seen, element, {
+        source: 'dom-element',
+        key: element.tagName ? element.tagName.toLowerCase() : 'element',
+        win,
+      });
+    });
+  }
+
+  function addHwpCandidate(candidates, seen, value, meta) {
+    if (!value || seen.has(value) || !looksLikeHwpController(value)) {
+      return;
+    }
+
+    seen.add(value);
+    candidates.push({
+      value,
+      meta,
+    });
+  }
+
+  function getWindowKeys(win) {
+    try {
+      return Object.getOwnPropertyNames(win);
+    } catch (_error) {
+      try {
+        return Object.keys(win);
+      } catch (__error) {
+        return [];
+      }
+    }
+  }
+
+  function getWindowValue(win, key) {
+    try {
+      return win[key];
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function getPotentialHwpElements(doc) {
+    try {
+      return Array.from(doc.querySelectorAll('object, embed, applet, [id], [name]')).filter((element) => {
+        const text = `${element.id || ''} ${element.getAttribute('name') || ''} ${element.getAttribute('type') || ''}`;
+        return /hwp|hancom|webhwp/i.test(text) || looksLikeHwpController(element);
+      });
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  function looksLikeHwpController(value) {
+    if (!value) {
+      return false;
+    }
+
+    return isRunnableHwpController(value)
+      || Boolean(value.HAction && typeof value.HAction.Run === 'function')
+      || Boolean(value.HParameterSet)
+      || Boolean(value.HwpCtrl)
+      || Boolean(value.hwpCtrl);
+  }
+
+  function isRunnableHwpController(value) {
+    if (!value) {
+      return false;
+    }
+
+    return typeof value.Run === 'function'
+      || Boolean(value.HAction && typeof value.HAction.Run === 'function')
+      || typeof value.CreateAction === 'function';
+  }
+
+  function runHwpAction(controller, actionId) {
+    try {
+      if (controller && typeof controller.Run === 'function') {
+        return {
+          ok: true,
+          via: 'Run',
+          value: controller.Run(actionId),
+        };
+      }
+
+      if (controller && controller.HAction && typeof controller.HAction.Run === 'function') {
+        return {
+          ok: true,
+          via: 'HAction.Run',
+          value: controller.HAction.Run(actionId),
+        };
+      }
+
+      if (controller && typeof controller.CreateAction === 'function') {
+        const action = controller.CreateAction(actionId);
+
+        if (action && typeof action.Run === 'function') {
+          return {
+            ok: true,
+            via: 'CreateAction.Run',
+            value: action.Run(),
+          };
+        }
+      }
+
+      return {
+        ok: false,
+        reason: 'no-runnable-method',
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error.name || 'action-error',
+        message: String(error.message || error),
+      };
+    }
+  }
+
+  function describeHwpControllerCandidate(candidate) {
+    const value = candidate.value;
+
+    return {
+      source: candidate.meta.source,
+      key: candidate.meta.key,
+      hasRun: Boolean(value && typeof value.Run === 'function'),
+      hasHActionRun: Boolean(value && value.HAction && typeof value.HAction.Run === 'function'),
+      hasCreateAction: Boolean(value && typeof value.CreateAction === 'function'),
+      hasHParameterSet: Boolean(value && value.HParameterSet),
+      hasHwpCtrl: Boolean(value && (value.HwpCtrl || value.hwpCtrl)),
+      hasFocus: safeDocumentHasFocus(candidate.meta.win.document),
+      focusDelegatedToIframe: isFocusDelegatingToChildFrame(candidate.meta.win),
+    };
+  }
+
+  function describeHwpControllerCandidates(win) {
+    return getHwpControllerCandidates(win).map(describeHwpControllerCandidate);
+  }
+
+  function isFocusDelegatingToChildFrame(win) {
+    try {
+      const active = win.document.activeElement;
+      return Boolean(active && active.tagName && active.tagName.toLowerCase() === 'iframe');
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function findKeyboardTarget(win, range) {
     const doc = win.document;
     const active = doc.activeElement;
@@ -935,6 +1229,8 @@
       contentEditableCount: safeCountSelector(doc, '[contenteditable]:not([contenteditable="false"])'),
       textareaCount: safeCountSelector(doc, 'textarea'),
       inputCount: safeCountSelector(doc, 'input'),
+      surfaceCounts: describeSurfaceCounts(doc),
+      hwpControllerCandidates: describeHwpControllerCandidates(win),
       activeElement: describeElement(activeElement),
       textControlSelection: describeTextControlSelection(activeElement),
       selection: describeSelection(win),
@@ -1052,6 +1348,40 @@
     }
   }
 
+  function describeSurfaceCounts(doc) {
+    return {
+      canvas: safeCountSelector(doc, 'canvas'),
+      object: safeCountSelector(doc, 'object'),
+      embed: safeCountSelector(doc, 'embed'),
+      applet: safeCountSelector(doc, 'applet'),
+      svg: safeCountSelector(doc, 'svg'),
+      video: safeCountSelector(doc, 'video'),
+      customElements: countCustomElements(doc),
+      hwpNamedElements: countHwpNamedElements(doc),
+    };
+  }
+
+  function countCustomElements(doc) {
+    try {
+      return Array.from(doc.querySelectorAll('*')).filter((element) => {
+        return element.tagName && element.tagName.indexOf('-') !== -1;
+      }).length;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function countHwpNamedElements(doc) {
+    try {
+      return Array.from(doc.querySelectorAll('[id], [name], object, embed, applet')).filter((element) => {
+        const text = `${element.id || ''} ${element.getAttribute('name') || ''} ${element.getAttribute('type') || ''}`;
+        return /hwp|hancom|webhwp/i.test(text);
+      }).length;
+    } catch (_error) {
+      return null;
+    }
+  }
+
   function getDirectFrameElementSnapshots() {
     const frames = Array.from(document.querySelectorAll('iframe'));
 
@@ -1111,6 +1441,12 @@
     const accessibleDirectFrames = directFrames.filter((frame) => frame.accessible).length;
     const sandboxedFrames = directFrames.filter((frame) => frame.sandbox.present).length;
     const contentEditableTotal = sumSnapshots(allSnapshots, 'contentEditableCount');
+    const hwpControllerTotal = sumArrayLengths(allSnapshots, 'hwpControllerCandidates');
+    const focusedHwpControllerTotal = allSnapshots.reduce((sum, snapshot) => {
+      const candidates = snapshot && Array.isArray(snapshot.hwpControllerCandidates) ? snapshot.hwpControllerCandidates : [];
+      return sum + candidates.filter((candidate) => candidate.hasFocus && !candidate.focusDelegatedToIframe).length;
+    }, 0);
+    const surfaceTotals = sumSurfaceCounts(allSnapshots);
     const hints = buildDiagnosticHints({
       topFrameCount,
       frameResponses,
@@ -1121,6 +1457,9 @@
       directFrameCount: directFrames.length,
       sandboxedFrames,
       contentEditableTotal,
+      hwpControllerTotal,
+      focusedHwpControllerTotal,
+      surfaceTotals,
     });
 
     const summaryLines = [
@@ -1132,6 +1471,8 @@
       `- input/textarea 선택: ${textControlSelectionCount}개`,
       `- 같은 출처 접근 가능 iframe: ${accessibleDirectFrames}/${directFrames.length}개`,
       `- contenteditable 후보: ${contentEditableTotal}개`,
+      `- HWP API 후보: ${hwpControllerTotal}개 (포커스 후보 ${focusedHwpControllerTotal}개)`,
+      `- 렌더링 표면: canvas ${surfaceTotals.canvas}, object ${surfaceTotals.object}, embed ${surfaceTotals.embed}, HWP 이름 요소 ${surfaceTotals.hwpNamedElements}`,
       ...hints.map((hint) => `- ${hint}`),
       '상세 JSON은 콘솔에 기록했습니다. 필요하면 복사 버튼을 누르세요.',
     ];
@@ -1152,6 +1493,9 @@
         directFrameCount: directFrames.length,
         sandboxedFrames,
         contentEditableTotal,
+        hwpControllerTotal,
+        focusedHwpControllerTotal,
+        surfaceTotals,
       },
       hints,
       userscriptResponses: responses,
@@ -1178,6 +1522,14 @@
 
     if (info.currentSelectionCount === 0 && info.rememberedSelectionCount === 0 && info.textControlSelectionCount === 0) {
       hints.push('DOM Selection API에서 선택 텍스트를 못 보고 있습니다. 편집기가 canvas/전용 렌더러일 가능성이 있습니다.');
+    }
+
+    if (info.hwpControllerTotal > 0 && info.currentSelectionCount === 0) {
+      hints.push('HWP API 후보가 보입니다. DOM 선택 대신 HWP 액션 직접 실행 경로를 사용할 수 있습니다.');
+    }
+
+    if (info.focusedHwpControllerTotal > 0) {
+      hints.push('포커스된 HWP API 후보가 있습니다. 1줄로 만들기 버튼이 API fallback을 시도합니다.');
     }
 
     if (info.rememberedSelectionCount > 0 && info.currentSelectionCount === 0) {
@@ -1220,6 +1572,43 @@
       const value = snapshot && typeof snapshot[key] === 'number' ? snapshot[key] : 0;
       return sum + value;
     }, 0);
+  }
+
+  function sumArrayLengths(snapshots, key) {
+    return snapshots.reduce((sum, snapshot) => {
+      const value = snapshot && Array.isArray(snapshot[key]) ? snapshot[key].length : 0;
+      return sum + value;
+    }, 0);
+  }
+
+  function sumSurfaceCounts(snapshots) {
+    return snapshots.reduce((sum, snapshot) => {
+      const counts = snapshot && snapshot.surfaceCounts ? snapshot.surfaceCounts : {};
+
+      sum.canvas += numberOrZero(counts.canvas);
+      sum.object += numberOrZero(counts.object);
+      sum.embed += numberOrZero(counts.embed);
+      sum.applet += numberOrZero(counts.applet);
+      sum.svg += numberOrZero(counts.svg);
+      sum.video += numberOrZero(counts.video);
+      sum.customElements += numberOrZero(counts.customElements);
+      sum.hwpNamedElements += numberOrZero(counts.hwpNamedElements);
+
+      return sum;
+    }, {
+      canvas: 0,
+      object: 0,
+      embed: 0,
+      applet: 0,
+      svg: 0,
+      video: 0,
+      customElements: 0,
+      hwpNamedElements: 0,
+    });
+  }
+
+  function numberOrZero(value) {
+    return typeof value === 'number' ? value : 0;
   }
 
   function getFrameAccessInfo(index) {
