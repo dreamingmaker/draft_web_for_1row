@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.2.0
+// @version      0.3.0
 // @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually becomes one line.
 // @match        *://*/*
+// @include      about:blank
+// @include      about:srcdoc
+// @include      blob:*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -11,12 +14,15 @@
 (function () {
   'use strict';
 
+  const SCRIPT_VERSION = '0.3.0';
+
   const CONFIG = {
     maxPresses: 60,
     settleMs: 80,
     stalledLimit: 8,
     requestWaitMs: 1200,
     overallWaitMs: 16000,
+    diagnoseWaitMs: 1800,
     minRectWidth: 1,
     minRectHeight: 1,
     lineTolerancePx: 2,
@@ -28,6 +34,8 @@
     run: 'run',
     abort: 'abort',
     status: 'status',
+    diagnose: 'diagnose',
+    diagnostic: 'diagnostic',
   };
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
@@ -35,10 +43,13 @@
   let running = false;
   let abortRequested = false;
   let currentRequestId = null;
+  let lastDiagnosticText = '';
 
   const handledRequests = new Set();
+  const handledDiagnosticRequests = new Set();
   const listenedDocuments = new WeakSet();
   const pendingTopRuns = new Map();
+  const pendingDiagnostics = new Map();
 
   window.addEventListener('message', handleFrameMessage, false);
   registerSelectionListeners();
@@ -72,8 +83,14 @@
         user-select: none;
       }
 
+      #${UI_ID} .actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 6px;
+      }
+
       #${UI_ID} button {
-        min-width: 118px;
+        min-width: 96px;
         height: 36px;
         padding: 0 13px;
         border: 1px solid rgba(0, 0, 0, 0.2);
@@ -90,6 +107,24 @@
 
       #${UI_ID} button:hover {
         background: #1e40af;
+      }
+
+      #${UI_ID} button.secondary {
+        min-width: 62px;
+        background: #374151;
+      }
+
+      #${UI_ID} button.secondary:hover {
+        background: #1f2937;
+      }
+
+      #${UI_ID} button.copy {
+        min-width: 54px;
+        background: #166534;
+      }
+
+      #${UI_ID} button.copy:hover {
+        background: #14532d;
       }
 
       #${UI_ID} button[data-running="true"] {
@@ -109,6 +144,30 @@
         text-align: right;
         white-space: normal;
       }
+
+      #${UI_ID} .debug {
+        box-sizing: border-box;
+        width: min(420px, calc(100vw - 36px));
+        max-height: 220px;
+        margin: 0;
+        padding: 8px;
+        overflow: auto;
+        border: 1px solid rgba(0, 0, 0, 0.14);
+        border-radius: 6px;
+        background: rgba(17, 24, 39, 0.96);
+        color: #f9fafb;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.45;
+        text-align: left;
+        user-select: text;
+        white-space: pre-wrap;
+      }
+
+      #${UI_ID} .debug[hidden] {
+        display: none;
+      }
     `;
 
     const panel = document.createElement('div');
@@ -118,17 +177,38 @@
     status.className = 'status';
     status.textContent = '텍스트를 드래그한 뒤 누르세요.';
 
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = '1줄로 만들기';
-    button.title = '선택한 텍스트에 Alt+Shift+N을 반복 적용합니다.';
+    const actions = document.createElement('div');
+    actions.className = 'actions';
 
-    panel.append(status, button);
+    const runButton = document.createElement('button');
+    runButton.type = 'button';
+    runButton.textContent = '1줄로 만들기';
+    runButton.title = '선택한 텍스트에 Alt+Shift+N을 반복 적용합니다.';
+
+    const diagnoseButton = document.createElement('button');
+    diagnoseButton.type = 'button';
+    diagnoseButton.className = 'secondary';
+    diagnoseButton.textContent = '진단';
+    diagnoseButton.title = 'iframe, 선택 영역, activeElement 상태를 진단합니다.';
+
+    const copyButton = document.createElement('button');
+    copyButton.type = 'button';
+    copyButton.className = 'copy';
+    copyButton.textContent = '복사';
+    copyButton.title = '마지막 진단 결과를 클립보드에 복사합니다.';
+
+    const debug = document.createElement('pre');
+    debug.className = 'debug';
+    debug.hidden = true;
+
+    actions.append(runButton, diagnoseButton, copyButton);
+
+    panel.append(status, actions, debug);
     document.documentElement.append(style, panel);
 
     panel.addEventListener('mousedown', (event) => event.preventDefault(), true);
 
-    button.addEventListener('click', async () => {
+    runButton.addEventListener('click', async () => {
       if (running) {
         abortRequested = true;
         broadcastToChildFrames({
@@ -143,8 +223,8 @@
 
       running = true;
       abortRequested = false;
-      button.dataset.running = 'true';
-      button.textContent = '중지';
+      runButton.dataset.running = 'true';
+      runButton.textContent = '중지';
 
       try {
         await requestOneLineFromAllFrames();
@@ -152,10 +232,21 @@
         running = false;
         abortRequested = false;
         currentRequestId = null;
-        button.dataset.running = 'false';
-        button.textContent = '1줄로 만들기';
+        runButton.dataset.running = 'false';
+        runButton.textContent = '1줄로 만들기';
       }
     });
+
+    diagnoseButton.addEventListener('click', async () => {
+      if (running) {
+        setStatus('실행 중에는 진단을 시작하지 않습니다. 먼저 중지해 주세요.');
+        return;
+      }
+
+      await runDiagnostic();
+    });
+
+    copyButton.addEventListener('click', copyLastDiagnostic);
   }
 
   function requestOneLineFromAllFrames() {
@@ -237,8 +328,79 @@
           console.error('[draft-web-for-1row] failed to process top selection', error);
           setStatus('오류가 발생했습니다. 콘솔 로그를 확인해 주세요.');
           finishPendingRun(requestId);
-        });
+      });
     });
+  }
+
+  function runDiagnostic() {
+    const requestId = createRequestId();
+    const directFrames = getDirectFrameElementSnapshots();
+    const sameOriginSnapshots = collectSameOriginWindowSnapshots();
+    const responses = [
+      buildDiagnosticSnapshot({
+        requestId,
+        framePath: [],
+        channel: 'top-userscript',
+      }),
+    ];
+
+    pendingDiagnostics.set(requestId, {
+      responses,
+      directFrames,
+      sameOriginSnapshots,
+      startedAt: Date.now(),
+    });
+
+    clearDebug();
+    setStatus(`진단 중... iframe ${window.frames.length}개 확인`);
+
+    broadcastDiagnosticToChildFrames({
+      source: SOURCE,
+      type: MESSAGE.diagnose,
+      requestId,
+      instanceId: INSTANCE_ID,
+      framePath: [],
+    });
+
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        const pending = pendingDiagnostics.get(requestId);
+
+        if (!pending) {
+          resolve(null);
+          return;
+        }
+
+        const report = buildDiagnosticReport(requestId, pending);
+        lastDiagnosticText = report.text;
+
+        setStatus(report.status);
+        showDebug(report.summary);
+
+        console.groupCollapsed('[draft-web-for-1row] diagnostic report');
+        console.log(report.data);
+        console.log(report.text);
+        console.groupEnd();
+
+        pendingDiagnostics.delete(requestId);
+        resolve(report);
+      }, CONFIG.diagnoseWaitMs);
+    });
+  }
+
+  async function copyLastDiagnostic() {
+    if (!lastDiagnosticText) {
+      setStatus('먼저 진단 버튼을 눌러 주세요.');
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(lastDiagnosticText);
+      setStatus('진단 결과를 클립보드에 복사했습니다.');
+    } catch (_error) {
+      showDebug(`${lastDiagnosticText}\n\n클립보드 복사 권한이 없어 콘솔/패널에서 복사해 주세요.`);
+      setStatus('복사 권한이 없어 패널과 콘솔에만 표시했습니다.');
+    }
   }
 
   async function makeSelectedTextOneLine(requestId, options = {}) {
@@ -335,6 +497,16 @@
 
     if (message.type === MESSAGE.status) {
       handleStatusMessage(message);
+      return;
+    }
+
+    if (message.type === MESSAGE.diagnose) {
+      handleDiagnoseMessage(message);
+      return;
+    }
+
+    if (message.type === MESSAGE.diagnostic) {
+      handleDiagnosticMessage(message);
     }
   }
 
@@ -404,6 +576,38 @@
     }
   }
 
+  function handleDiagnoseMessage(message) {
+    if (!message.requestId || handledDiagnosticRequests.has(message.requestId)) {
+      return;
+    }
+
+    handledDiagnosticRequests.add(message.requestId);
+
+    postDiagnosticSnapshot(buildDiagnosticSnapshot({
+      requestId: message.requestId,
+      framePath: Array.isArray(message.framePath) ? message.framePath : [],
+      channel: 'frame-userscript',
+    }));
+
+    broadcastDiagnosticToChildFrames(message);
+  }
+
+  function handleDiagnosticMessage(message) {
+    if (!isTopFrame()) {
+      window.parent.postMessage(message, '*');
+      return;
+    }
+
+    const pending = pendingDiagnostics.get(message.requestId);
+
+    if (!pending || !message.diagnostic) {
+      return;
+    }
+
+    pending.responses.push(message.diagnostic);
+    setStatus(`진단 중... 응답 ${pending.responses.length}개 수집`);
+  }
+
   function markPendingClaimed(requestId) {
     const pending = pendingTopRuns.get(requestId);
 
@@ -437,6 +641,38 @@
         // Some frames may disappear while the broadcast is in progress.
       }
     }
+  }
+
+  function broadcastDiagnosticToChildFrames(message) {
+    const basePath = Array.isArray(message.framePath) ? message.framePath : [];
+
+    for (let index = 0; index < window.frames.length; index += 1) {
+      try {
+        window.frames[index].postMessage({
+          ...message,
+          framePath: basePath.concat(index),
+        }, '*');
+      } catch (_error) {
+        // Some frames may disappear while the broadcast is in progress.
+      }
+    }
+  }
+
+  function postDiagnosticSnapshot(diagnostic) {
+    const message = {
+      source: SOURCE,
+      type: MESSAGE.diagnostic,
+      requestId: diagnostic.requestId,
+      diagnostic,
+      instanceId: INSTANCE_ID,
+    };
+
+    if (isTopFrame()) {
+      handleDiagnosticMessage(message);
+      return;
+    }
+
+    window.parent.postMessage(message, '*');
   }
 
   function dispatchAltShiftN(selectionInfo) {
@@ -678,6 +914,525 @@
     }
   }
 
+  function buildDiagnosticSnapshot({ requestId, framePath, channel, win = window, inspectionIndex = null }) {
+    const doc = win.document;
+    const activeElement = doc.activeElement;
+
+    return {
+      requestId,
+      version: SCRIPT_VERSION,
+      channel,
+      instanceId: INSTANCE_ID,
+      framePath: formatFramePath(framePath),
+      frameDepth: Array.isArray(framePath) ? framePath.length : null,
+      inspectionIndex,
+      isTopFrame: isWindowTop(win),
+      url: sanitizeUrl(win.location.href),
+      readyState: doc.readyState,
+      hasFocus: safeDocumentHasFocus(doc),
+      childFrameCount: win.frames.length,
+      iframeElementCount: safeCountSelector(doc, 'iframe'),
+      contentEditableCount: safeCountSelector(doc, '[contenteditable]:not([contenteditable="false"])'),
+      textareaCount: safeCountSelector(doc, 'textarea'),
+      inputCount: safeCountSelector(doc, 'input'),
+      activeElement: describeElement(activeElement),
+      textControlSelection: describeTextControlSelection(activeElement),
+      selection: describeSelection(win),
+      lastSelection: describeLastSelection(win),
+      collectedAt: new Date().toISOString(),
+    };
+  }
+
+  function describeSelection(win) {
+    try {
+      const selection = win.getSelection();
+
+      if (!selection) {
+        return {
+          available: false,
+          hasSelection: false,
+          reason: 'no-selection-object',
+        };
+      }
+
+      const textLength = selection.toString().length;
+      const range = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+
+      return {
+        available: true,
+        hasSelection: !selection.isCollapsed && selection.rangeCount > 0,
+        isCollapsed: selection.isCollapsed,
+        rangeCount: selection.rangeCount,
+        textLength,
+        lineCount: range ? countSelectionLines(range) : 0,
+        rectCount: range ? getUsefulRects(range).length : 0,
+        rangeBox: range ? describeRect(range.getBoundingClientRect()) : null,
+        commonAncestor: range ? describeNode(range.commonAncestorContainer) : null,
+        anchorNode: describeNode(selection.anchorNode),
+        focusNode: describeNode(selection.focusNode),
+      };
+    } catch (error) {
+      return {
+        available: false,
+        hasSelection: false,
+        reason: error.name || 'selection-error',
+      };
+    }
+  }
+
+  function describeLastSelection(win = window) {
+    if (!lastSelection || !lastSelection.ranges.length) {
+      return {
+        available: false,
+        hasSelection: false,
+      };
+    }
+
+    if (lastSelection.win !== win) {
+      return {
+        available: false,
+        hasSelection: false,
+        reason: 'selection-belongs-to-another-window',
+      };
+    }
+
+    try {
+      const range = lastSelection.ranges[0];
+
+      return {
+        available: true,
+        hasSelection: !range.collapsed,
+        rangeCount: lastSelection.ranges.length,
+        lineCount: countSelectionLines(range),
+        rectCount: getUsefulRects(range).length,
+        rangeBox: describeRect(range.getBoundingClientRect()),
+        commonAncestor: describeNode(range.commonAncestorContainer),
+      };
+    } catch (error) {
+      return {
+        available: false,
+        hasSelection: false,
+        reason: error.name || 'last-selection-error',
+      };
+    }
+  }
+
+  function describeTextControlSelection(element) {
+    if (!isTextControl(element)) {
+      return {
+        available: false,
+        hasSelection: false,
+      };
+    }
+
+    try {
+      const start = element.selectionStart;
+      const end = element.selectionEnd;
+
+      if (typeof start !== 'number' || typeof end !== 'number') {
+        return {
+          available: false,
+          hasSelection: false,
+          reason: 'selectionStart-unavailable',
+        };
+      }
+
+      return {
+        available: true,
+        hasSelection: end > start,
+        selectionLength: Math.max(0, end - start),
+        valueLength: typeof element.value === 'string' ? element.value.length : null,
+      };
+    } catch (error) {
+      return {
+        available: false,
+        hasSelection: false,
+        reason: error.name || 'text-control-selection-error',
+      };
+    }
+  }
+
+  function getDirectFrameElementSnapshots() {
+    const frames = Array.from(document.querySelectorAll('iframe'));
+
+    return frames.map((frame, index) => {
+      const rect = frame.getBoundingClientRect();
+      const access = getFrameAccessInfo(index);
+
+      return {
+        index,
+        src: sanitizeUrl(frame.getAttribute('src') || frame.src || ''),
+        titleHash: frame.getAttribute('title') ? hashString(frame.getAttribute('title')) : null,
+        nameHash: frame.getAttribute('name') ? hashString(frame.getAttribute('name')) : null,
+        idHash: frame.id ? hashString(frame.id) : null,
+        classHash: frame.className ? hashString(String(frame.className)) : null,
+        sandbox: describeSandbox(frame),
+        visible: rect.width > 0 && rect.height > 0,
+        rect: describeRect(rect),
+        accessible: access.accessible,
+        access,
+      };
+    });
+  }
+
+  function collectSameOriginWindowSnapshots() {
+    return collectReachableWindows(window)
+      .filter((win) => win !== window)
+      .map((win, index) => {
+        try {
+          return buildDiagnosticSnapshot({
+            requestId: 'same-origin-inspection',
+            framePath: null,
+            channel: 'top-same-origin-inspection',
+            win,
+            inspectionIndex: index,
+          });
+        } catch (error) {
+          return {
+            channel: 'top-same-origin-inspection',
+            inspectionIndex: index,
+            error: error.name || 'inspection-error',
+          };
+        }
+      });
+  }
+
+  function buildDiagnosticReport(requestId, pending) {
+    const responses = pending.responses.slice();
+    const sameOriginSnapshots = pending.sameOriginSnapshots.slice();
+    const allSnapshots = responses.concat(sameOriginSnapshots);
+    const directFrames = pending.directFrames;
+    const elapsedMs = Date.now() - pending.startedAt;
+    const topFrameCount = window.frames.length;
+    const frameResponses = responses.filter((snapshot) => !snapshot.isTopFrame).length;
+    const currentSelectionCount = allSnapshots.filter((snapshot) => hasCurrentDomSelection(snapshot)).length;
+    const rememberedSelectionCount = allSnapshots.filter((snapshot) => hasRememberedSelection(snapshot)).length;
+    const textControlSelectionCount = allSnapshots.filter((snapshot) => hasTextControlSelection(snapshot)).length;
+    const accessibleDirectFrames = directFrames.filter((frame) => frame.accessible).length;
+    const sandboxedFrames = directFrames.filter((frame) => frame.sandbox.present).length;
+    const contentEditableTotal = sumSnapshots(allSnapshots, 'contentEditableCount');
+    const hints = buildDiagnosticHints({
+      topFrameCount,
+      frameResponses,
+      currentSelectionCount,
+      rememberedSelectionCount,
+      textControlSelectionCount,
+      accessibleDirectFrames,
+      directFrameCount: directFrames.length,
+      sandboxedFrames,
+      contentEditableTotal,
+    });
+
+    const summaryLines = [
+      `진단 완료 (${elapsedMs}ms)`,
+      `- 상위 iframe: ${topFrameCount}개`,
+      `- userscript 응답: ${responses.length}개 (iframe ${frameResponses}개)`,
+      `- 현재 DOM 선택 발견: ${currentSelectionCount}개`,
+      `- 저장된 선택 후보: ${rememberedSelectionCount}개`,
+      `- input/textarea 선택: ${textControlSelectionCount}개`,
+      `- 같은 출처 접근 가능 iframe: ${accessibleDirectFrames}/${directFrames.length}개`,
+      `- contenteditable 후보: ${contentEditableTotal}개`,
+      ...hints.map((hint) => `- ${hint}`),
+      '상세 JSON은 콘솔에 기록했습니다. 필요하면 복사 버튼을 누르세요.',
+    ];
+
+    const data = {
+      script: SOURCE,
+      version: SCRIPT_VERSION,
+      requestId,
+      elapsedMs,
+      summary: {
+        topFrameCount,
+        userscriptResponseCount: responses.length,
+        frameResponseCount: frameResponses,
+        currentSelectionCount,
+        rememberedSelectionCount,
+        textControlSelectionCount,
+        accessibleDirectFrames,
+        directFrameCount: directFrames.length,
+        sandboxedFrames,
+        contentEditableTotal,
+      },
+      hints,
+      userscriptResponses: responses,
+      sameOriginSnapshots,
+      directFrames,
+    };
+
+    return {
+      status: currentSelectionCount > 0 || rememberedSelectionCount > 0
+        ? `진단 완료: 선택 후보 ${currentSelectionCount + rememberedSelectionCount}개 발견`
+        : '진단 완료: 선택 영역 0개',
+      summary: summaryLines.join('\n'),
+      text: `${summaryLines.join('\n')}\n\nJSON:\n${JSON.stringify(data, null, 2)}`,
+      data,
+    };
+  }
+
+  function buildDiagnosticHints(info) {
+    const hints = [];
+
+    if (info.topFrameCount > 0 && info.frameResponses === 0) {
+      hints.push('iframe userscript 응답이 없습니다. Tampermonkey가 iframe에서 실행되지 않거나 about:blank/blob/sandbox iframe일 수 있습니다.');
+    }
+
+    if (info.currentSelectionCount === 0 && info.rememberedSelectionCount === 0 && info.textControlSelectionCount === 0) {
+      hints.push('DOM Selection API에서 선택 텍스트를 못 보고 있습니다. 편집기가 canvas/전용 렌더러일 가능성이 있습니다.');
+    }
+
+    if (info.rememberedSelectionCount > 0 && info.currentSelectionCount === 0) {
+      hints.push('선택이 한 번은 잡혔지만 버튼 클릭 후 사라집니다. focus/selection 복원 경로를 강화해야 합니다.');
+    }
+
+    if (info.currentSelectionCount > 0) {
+      hints.push('선택 영역은 보입니다. 다음 문제는 Alt+Shift+N 이벤트가 에디터에 먹히는지입니다.');
+    }
+
+    if (info.directFrameCount > 0 && info.accessibleDirectFrames === 0) {
+      hints.push('상위 페이지에서 직접 접근 가능한 iframe이 없습니다. iframe 내부 userscript 응답이 특히 중요합니다.');
+    }
+
+    if (info.sandboxedFrames > 0) {
+      hints.push(`sandbox iframe ${info.sandboxedFrames}개가 있습니다. sandbox 설정이 스크립트 주입을 막을 수 있습니다.`);
+    }
+
+    if (info.contentEditableTotal === 0 && info.currentSelectionCount === 0) {
+      hints.push('contenteditable 후보가 없습니다. 일반 웹 편집기가 아닌 렌더링 표면일 수 있습니다.');
+    }
+
+    return hints.slice(0, 5);
+  }
+
+  function hasCurrentDomSelection(snapshot) {
+    return Boolean(snapshot && snapshot.selection && snapshot.selection.hasSelection);
+  }
+
+  function hasRememberedSelection(snapshot) {
+    return Boolean(snapshot && snapshot.lastSelection && snapshot.lastSelection.hasSelection);
+  }
+
+  function hasTextControlSelection(snapshot) {
+    return Boolean(snapshot && snapshot.textControlSelection && snapshot.textControlSelection.hasSelection);
+  }
+
+  function sumSnapshots(snapshots, key) {
+    return snapshots.reduce((sum, snapshot) => {
+      const value = snapshot && typeof snapshot[key] === 'number' ? snapshot[key] : 0;
+      return sum + value;
+    }, 0);
+  }
+
+  function getFrameAccessInfo(index) {
+    try {
+      const child = window.frames[index];
+
+      if (!child) {
+        return {
+          accessible: false,
+          reason: 'missing-window',
+        };
+      }
+
+      void child.document;
+
+      return {
+        accessible: true,
+        url: sanitizeUrl(child.location.href),
+        readyState: child.document.readyState,
+        childFrameCount: child.frames.length,
+      };
+    } catch (error) {
+      return {
+        accessible: false,
+        reason: error.name || 'blocked',
+      };
+    }
+  }
+
+  function describeSandbox(frame) {
+    const value = frame.getAttribute('sandbox');
+
+    if (value === null) {
+      return {
+        present: false,
+        tokens: [],
+      };
+    }
+
+    return {
+      present: true,
+      tokens: value.split(/\s+/).filter(Boolean).sort(),
+    };
+  }
+
+  function describeElement(element) {
+    if (!element) {
+      return null;
+    }
+
+    return {
+      tag: element.tagName ? element.tagName.toLowerCase() : null,
+      idHash: element.id ? hashString(element.id) : null,
+      classHash: element.className ? hashString(String(element.className)) : null,
+      classCount: typeof element.className === 'string' && element.className.trim()
+        ? element.className.trim().split(/\s+/).length
+        : 0,
+      role: element.getAttribute ? element.getAttribute('role') : null,
+      contentEditable: element.getAttribute ? element.getAttribute('contenteditable') : null,
+      isContentEditable: Boolean(element.isContentEditable),
+      editableAncestor: describeEditableAncestor(element),
+    };
+  }
+
+  function describeEditableAncestor(element) {
+    try {
+      const editable = element.closest('[contenteditable]:not([contenteditable="false"]), textarea, input');
+
+      if (!editable) {
+        return null;
+      }
+
+      return {
+        tag: editable.tagName ? editable.tagName.toLowerCase() : null,
+        idHash: editable.id ? hashString(editable.id) : null,
+        classHash: editable.className ? hashString(String(editable.className)) : null,
+        contentEditable: editable.getAttribute ? editable.getAttribute('contenteditable') : null,
+      };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function describeNode(node) {
+    if (!node) {
+      return null;
+    }
+
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+
+    return {
+      nodeType: node.nodeType,
+      nodeName: node.nodeName,
+      parentElement: describeElement(element),
+    };
+  }
+
+  function describeRect(rect) {
+    if (!rect) {
+      return null;
+    }
+
+    return {
+      left: roundNumber(rect.left),
+      top: roundNumber(rect.top),
+      right: roundNumber(rect.right),
+      bottom: roundNumber(rect.bottom),
+      width: roundNumber(rect.width),
+      height: roundNumber(rect.height),
+    };
+  }
+
+  function isTextControl(element) {
+    if (!element || !element.tagName) {
+      return false;
+    }
+
+    const tag = element.tagName.toLowerCase();
+
+    if (tag === 'textarea') {
+      return true;
+    }
+
+    if (tag !== 'input') {
+      return false;
+    }
+
+    const type = (element.getAttribute('type') || 'text').toLowerCase();
+    return ['text', 'search', 'url', 'tel', 'password', 'email', 'number'].includes(type);
+  }
+
+  function isWindowTop(win) {
+    try {
+      return win.parent === win;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function safeDocumentHasFocus(doc) {
+    try {
+      return doc.hasFocus();
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function safeCountSelector(doc, selector) {
+    try {
+      return doc.querySelectorAll(selector).length;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function sanitizeUrl(rawUrl) {
+    if (!rawUrl) {
+      return 'empty';
+    }
+
+    if (rawUrl === 'about:blank') {
+      return 'about:blank';
+    }
+
+    if (rawUrl.startsWith('blob:')) {
+      return 'blob:url';
+    }
+
+    if (rawUrl.startsWith('data:')) {
+      return 'data:url';
+    }
+
+    try {
+      const parsed = new URL(rawUrl, window.location.href);
+      const pathDepth = parsed.pathname.split('/').filter(Boolean).length;
+
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        return `${parsed.protocol}//host(len:${parsed.hostname.length},parts:${parsed.hostname.split('.').length})/path(depth:${pathDepth})`;
+      }
+
+      return `${parsed.protocol}url/path(depth:${pathDepth})`;
+    } catch (_error) {
+      return `unparsed-url(len:${String(rawUrl).length})`;
+    }
+  }
+
+  function formatFramePath(framePath) {
+    if (!Array.isArray(framePath)) {
+      return null;
+    }
+
+    if (!framePath.length) {
+      return 'top';
+    }
+
+    return framePath.join('>');
+  }
+
+  function hashString(value) {
+    const text = String(value);
+    let hash = 0;
+
+    for (let index = 0; index < text.length; index += 1) {
+      hash = ((hash << 5) - hash + text.charCodeAt(index)) | 0;
+    }
+
+    return `h${Math.abs(hash).toString(36)}`;
+  }
+
+  function roundNumber(value) {
+    return Math.round(value * 10) / 10;
+  }
+
   function registerSelectionListeners() {
     const windows = collectReachableWindows(window);
 
@@ -747,6 +1502,38 @@
       terminal: Boolean(meta.terminal),
       instanceId: INSTANCE_ID,
     }, '*');
+  }
+
+  function showDebug(message) {
+    if (!isTopFrame()) {
+      return;
+    }
+
+    const panel = document.getElementById(UI_ID);
+    const debug = panel ? panel.querySelector('.debug') : null;
+
+    if (!debug) {
+      return;
+    }
+
+    debug.hidden = false;
+    debug.textContent = message;
+  }
+
+  function clearDebug() {
+    if (!isTopFrame()) {
+      return;
+    }
+
+    const panel = document.getElementById(UI_ID);
+    const debug = panel ? panel.querySelector('.debug') : null;
+
+    if (!debug) {
+      return;
+    }
+
+    debug.hidden = true;
+    debug.textContent = '';
   }
 
   function createRequestId() {
