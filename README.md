@@ -29,6 +29,16 @@ apiFallbackPresses: 4, // 4칸 단축
 apiExpandPresses: 2,   // 2칸 늘리기
 ```
 
+## GitLab 등록
+
+GitLab 저장소에 올릴 때는 아래 명령을 실행한 뒤 토큰만 입력합니다.
+
+```bash
+./push_gitlab.sh
+```
+
+GitLab Personal Access Token에는 `write_repository` 권한이 필요합니다.
+
 ## 메모
 
 0.8.4에서 실행 중 `2칸 늘리기` 버튼을 눌러도 중지 요청이 동작하도록 고쳤습니다.
