@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.4.0
-// @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually becomes one line.
+// @version      0.5.0
+// @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually uses one fewer line.
 // @match        *://*/*
 // @include      about:blank
 // @include      about:srcdoc
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.4.0';
+  const SCRIPT_VERSION = '0.5.0';
 
   const CONFIG = {
     maxPresses: 60,
@@ -23,7 +23,8 @@
     requestWaitMs: 1200,
     overallWaitMs: 16000,
     diagnoseWaitMs: 1800,
-    apiFallbackPresses: 6,
+    apiFallbackPresses: 4,
+    apiDebugPresses: 1,
     apiFallbackDelayMs: 70,
     minRectWidth: 1,
     minRectHeight: 1,
@@ -88,6 +89,7 @@
       #${UI_ID} .actions {
         display: flex;
         justify-content: flex-end;
+        flex-wrap: wrap;
         gap: 6px;
       }
 
@@ -118,6 +120,15 @@
 
       #${UI_ID} button.secondary:hover {
         background: #1f2937;
+      }
+
+      #${UI_ID} button.debug-once {
+        min-width: 48px;
+        background: #6d28d9;
+      }
+
+      #${UI_ID} button.debug-once:hover {
+        background: #5b21b6;
       }
 
       #${UI_ID} button.copy {
@@ -184,8 +195,14 @@
 
     const runButton = document.createElement('button');
     runButton.type = 'button';
-    runButton.textContent = '1줄로 만들기';
-    runButton.title = '선택한 텍스트에 Alt+Shift+N을 반복 적용합니다.';
+    runButton.textContent = '한 줄 줄이기';
+    runButton.title = '선택한 텍스트가 현재보다 한 줄 덜 차지하도록 자간을 줄입니다.';
+
+    const debugOnceButton = document.createElement('button');
+    debugOnceButton.type = 'button';
+    debugOnceButton.className = 'debug-once';
+    debugOnceButton.textContent = '1회';
+    debugOnceButton.title = 'HWP API 자간 좁히기 액션을 한 번만 실행하고 로그를 남깁니다.';
 
     const diagnoseButton = document.createElement('button');
     diagnoseButton.type = 'button';
@@ -203,7 +220,7 @@
     debug.className = 'debug';
     debug.hidden = true;
 
-    actions.append(runButton, diagnoseButton, copyButton);
+    actions.append(runButton, debugOnceButton, diagnoseButton, copyButton);
 
     panel.append(status, actions, debug);
     document.documentElement.append(style, panel);
@@ -235,8 +252,17 @@
         abortRequested = false;
         currentRequestId = null;
         runButton.dataset.running = 'false';
-        runButton.textContent = '1줄로 만들기';
+        runButton.textContent = '한 줄 줄이기';
       }
+    });
+
+    debugOnceButton.addEventListener('click', async () => {
+      if (running) {
+        setStatus('실행 중에는 1회 테스트를 시작하지 않습니다. 먼저 중지해 주세요.');
+        return;
+      }
+
+      await runHwpApiDebugPress();
     });
 
     diagnoseButton.addEventListener('click', async () => {
@@ -405,6 +431,34 @@
     }
   }
 
+  async function runHwpApiDebugPress() {
+    const requestId = createRequestId();
+
+    clearDebug();
+    setStatus('HWP API 1회 테스트 중...');
+
+    const result = await applyHwpApiFallback(requestId, {
+      includeReachableFrames: true,
+      silentNoSelection: true,
+      presses: CONFIG.apiDebugPresses,
+      debugLabel: 'HWP API 1회 테스트',
+      forceDebug: true,
+    });
+
+    if (!result.applied) {
+      const text = [
+        'HWP API 1회 테스트 실패',
+        `- 이유: ${result.reason || 'candidate-not-found'}`,
+        '- 진단 버튼으로 HWP API 후보 수를 확인해 주세요.',
+      ].join('\n');
+
+      lastDiagnosticText = text;
+      setStatus('HWP API 1회 테스트 실패');
+      showDebug(text);
+      console.warn('[draft-web-for-1row] HWP API debug press failed', result);
+    }
+  }
+
   async function makeSelectedTextOneLine(requestId, options = {}) {
     const selected = getCurrentSelection(options) || restoreLastSelection(options);
 
@@ -430,12 +484,15 @@
       return { found: true, terminal: true };
     }
 
-    if (lines <= 1) {
+    const initialLines = lines;
+    const targetLines = Math.max(1, initialLines - 1);
+
+    if (initialLines <= 1) {
       setStatus('이미 1줄입니다.', { requestId, found: true, terminal: true });
       return { found: true, terminal: true };
     }
 
-    setStatus(`선택 영역 확인: ${lines}줄`, { requestId, found: true });
+    setStatus(`선택 영역 확인: ${initialLines}줄 -> 목표 ${targetLines}줄`, { requestId, found: true });
 
     let previousSignature = getRangeSignature(selected.range);
     let stalledCount = 0;
@@ -460,8 +517,12 @@
       rememberSelection(nextSelection.win);
       lines = countSelectionLines(nextSelection.range);
 
-      if (lines <= 1) {
-        setStatus(`완료: ${pressCount}회 적용했습니다.`, { requestId, found: true, terminal: true });
+      if (lines <= targetLines) {
+        setStatus(`완료: ${initialLines}줄 -> ${lines}줄, ${pressCount}회 적용했습니다.`, {
+          requestId,
+          found: true,
+          terminal: true,
+        });
         return { found: true, terminal: true };
       }
 
@@ -474,7 +535,10 @@
         previousSignature = nextSignature;
       }
 
-      setStatus(`조정 중: ${lines}줄, ${pressCount}회 적용`, { requestId, found: true });
+      setStatus(`조정 중: ${initialLines}줄 -> 목표 ${targetLines}줄, 현재 ${lines}줄, ${pressCount}회 적용`, {
+        requestId,
+        found: true,
+      });
 
       if (stalledCount >= CONFIG.stalledLimit) {
         setStatus('단축키 반응이 없거나 더 줄어들지 않습니다.', { requestId, found: true, terminal: true });
@@ -482,34 +546,60 @@
       }
     }
 
-    setStatus(`최대 ${CONFIG.maxPresses}회까지 적용했지만 ${lines}줄입니다.`, { requestId, found: true, terminal: true });
+    setStatus(`최대 ${CONFIG.maxPresses}회까지 적용했지만 ${lines}줄입니다. 목표는 ${targetLines}줄입니다.`, {
+      requestId,
+      found: true,
+      terminal: true,
+    });
     return { found: true, terminal: true };
   }
 
   async function applyHwpApiFallback(requestId, options = {}) {
     const target = findBestHwpActionTarget(options);
+    const presses = normalizePressCount(options.presses, CONFIG.apiFallbackPresses);
+    const label = options.debugLabel || 'HWP API fallback';
+    const startedAt = Date.now();
+    const actionResults = [];
 
     if (!target) {
-      return { applied: false };
+      return {
+        applied: false,
+        reason: 'candidate-not-found',
+        presses,
+      };
     }
 
     let applied = 0;
-    setStatus(`DOM 선택은 보이지 않습니다. HWP API로 자간 좁히기 ${CONFIG.apiFallbackPresses}회 시도 중...`, {
+    setStatus(`DOM 선택은 보이지 않습니다. HWP API로 자간 좁히기 ${presses}회 시도 중...`, {
       requestId,
       found: true,
     });
 
-    for (let index = 0; index < CONFIG.apiFallbackPresses; index += 1) {
+    for (let index = 0; index < presses; index += 1) {
       if (abortRequested) {
-        setStatus(`중지했습니다. HWP API ${applied}회 적용했습니다.`, {
-          requestId,
-          found: true,
-          terminal: true,
+        const report = buildApiFallbackReport({
+          label,
+          target,
+          requestedPresses: presses,
+          applied,
+          actionResults,
+          startedAt,
+          stopped: true,
         });
-        return { applied: applied > 0 };
+
+        publishApiFallbackReport(report, requestId, `중지했습니다. HWP API ${applied}회 적용했습니다.`);
+        return { applied: applied > 0, report };
       }
 
+      const actionStartedAt = Date.now();
       const result = runHwpAction(target.controller, 'CharShapeSpacingDecrease');
+      actionResults.push({
+        index: index + 1,
+        elapsedMs: Date.now() - actionStartedAt,
+        ok: result.ok,
+        via: result.via || null,
+        reason: result.reason || null,
+      });
 
       if (!result.ok) {
         console.warn('[draft-web-for-1row] HWP action failed', {
@@ -518,12 +608,21 @@
         });
 
         if (applied === 0) {
-          setStatus(`HWP API 후보는 찾았지만 실행 실패: ${result.reason}`, {
-            requestId,
-            found: false,
-            terminal: true,
+          const report = buildApiFallbackReport({
+            label,
+            target,
+            requestedPresses: presses,
+            applied,
+            actionResults,
+            startedAt,
+            failure: result.reason,
           });
-          return { applied: false };
+
+          if (options.forceDebug || options.includeReachableFrames) {
+            publishApiFallbackReport(report, requestId, `HWP API 후보는 찾았지만 실행 실패: ${result.reason}`);
+          }
+
+          return { applied: false, reason: result.reason, report };
         }
 
         break;
@@ -533,13 +632,96 @@
       await sleep(CONFIG.apiFallbackDelayMs);
     }
 
-    setStatus(`HWP API로 자간 좁히기 ${applied}회 적용했습니다. DOM 줄 수는 확인하지 못했습니다.`, {
+    const report = buildApiFallbackReport({
+      label,
+      target,
+      requestedPresses: presses,
+      applied,
+      actionResults,
+      startedAt,
+    });
+    const message = `HWP API로 자간 좁히기 ${applied}회 적용했습니다. DOM 줄 수는 확인하지 못했습니다.`;
+
+    publishApiFallbackReport(report, requestId, message, options.forceDebug);
+
+    return { applied: applied > 0, report };
+  }
+
+  function normalizePressCount(value, fallback) {
+    const numberValue = Number(value);
+
+    if (!Number.isFinite(numberValue)) {
+      return fallback;
+    }
+
+    return Math.max(1, Math.min(CONFIG.maxPresses, Math.floor(numberValue)));
+  }
+
+  function buildApiFallbackReport({
+    label,
+    target,
+    requestedPresses,
+    applied,
+    actionResults,
+    startedAt,
+    stopped = false,
+    failure = null,
+  }) {
+    const elapsedMs = Date.now() - startedAt;
+    const okCount = actionResults.filter((result) => result.ok).length;
+    const failCount = actionResults.length - okCount;
+    const avgMs = actionResults.length
+      ? Math.round(actionResults.reduce((sum, result) => sum + result.elapsedMs, 0) / actionResults.length)
+      : 0;
+    const summaryLines = [
+      label,
+      `- 요청 횟수: ${requestedPresses}`,
+      `- 적용 횟수: ${applied}`,
+      `- 실패 횟수: ${failCount}`,
+      `- 총 시간: ${elapsedMs}ms`,
+      `- 액션 평균: ${avgMs}ms`,
+      `- 실행 경로: ${target.description.hasRun ? 'Run' : target.description.hasHActionRun ? 'HAction.Run' : 'CreateAction.Run'}`,
+      `- 포커스 후보: ${target.description.hasFocus && !target.description.focusDelegatedToIframe ? 'Y' : 'N'}`,
+      `- 중지됨: ${stopped ? 'Y' : 'N'}`,
+      `- 실패 사유: ${failure || 'none'}`,
+      'DOM 줄 수는 확인하지 못합니다. 1회 버튼으로 적정 횟수를 빠르게 맞춰 보세요.',
+    ];
+    const data = {
+      script: SOURCE,
+      version: SCRIPT_VERSION,
+      label,
+      requestedPresses,
+      applied,
+      failCount,
+      elapsedMs,
+      avgActionMs: avgMs,
+      stopped,
+      failure,
+      target: target.description,
+      actionResults,
+      collectedAt: new Date().toISOString(),
+    };
+
+    return {
+      summary: summaryLines.join('\n'),
+      text: `${summaryLines.join('\n')}\n\nJSON:\n${JSON.stringify(data, null, 2)}`,
+      data,
+    };
+  }
+
+  function publishApiFallbackReport(report, requestId, statusMessage) {
+    lastDiagnosticText = report.text;
+    setStatus(statusMessage, {
       requestId,
       found: true,
       terminal: true,
     });
+    showDebug(report.summary);
 
-    return { applied: applied > 0 };
+    console.groupCollapsed('[draft-web-for-1row] HWP API action report');
+    console.log(report.data);
+    console.log(report.text);
+    console.groupEnd();
   }
 
   function handleFrameMessage(event) {
@@ -1529,7 +1711,7 @@
     }
 
     if (info.focusedHwpControllerTotal > 0) {
-      hints.push('포커스된 HWP API 후보가 있습니다. 1줄로 만들기 버튼이 API fallback을 시도합니다.');
+      hints.push('포커스된 HWP API 후보가 있습니다. 한 줄 줄이기 버튼이 API fallback을 시도합니다.');
     }
 
     if (info.rememberedSelectionCount > 0 && info.currentSelectionCount === 0) {
