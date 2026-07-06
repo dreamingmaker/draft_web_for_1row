@@ -29,18 +29,6 @@ apiFallbackPresses: 4, // 4칸 단축
 apiExpandPresses: 2,   // 2칸 늘리기
 ```
 
-## GitLab 등록
-
-GitLab 저장소에 올릴 때는 아래 명령을 실행한 뒤 토큰만 입력합니다.
-
-```bash
-./push_gitlab.sh
-```
-
-GitLab Personal Access Token에는 `write_repository` 권한이 필요합니다.
-403 오류가 나면 토큰 주인이 프로젝트의 Developer/Maintainer 권한을 갖고 있는지, `main` 브랜치가 보호 브랜치인지 확인해야 합니다.
-GitLab의 기존 초기 커밋은 로컬 히스토리에 병합해 두었기 때문에 기본 스크립트는 강제 푸시를 사용하지 않습니다.
-
 ## 메모
 
 0.8.4에서 실행 중 `2칸 늘리기` 버튼을 눌러도 중지 요청이 동작하도록 고쳤습니다.
