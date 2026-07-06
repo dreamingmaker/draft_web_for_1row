@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.5.0
+// @version      0.6.0
 // @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually uses one fewer line.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.0';
+  const SCRIPT_VERSION = '0.6.0';
 
   const CONFIG = {
     maxPresses: 60,
@@ -26,6 +26,7 @@
     apiFallbackPresses: 4,
     apiDebugPresses: 1,
     apiFallbackDelayMs: 70,
+    stopApiFallbackOnLineChange: true,
     minRectWidth: 1,
     minRectHeight: 1,
     lineTolerancePx: 2,
@@ -591,15 +592,20 @@
         return { applied: applied > 0, report };
       }
 
+      const beforeObservation = getHwpLayoutObservation(target.controller);
       const actionStartedAt = Date.now();
       const result = runHwpAction(target.controller, 'CharShapeSpacingDecrease');
-      actionResults.push({
+      const actionRecord = {
         index: index + 1,
         elapsedMs: Date.now() - actionStartedAt,
         ok: result.ok,
         via: result.via || null,
         reason: result.reason || null,
-      });
+        before: beforeObservation,
+        after: null,
+        lineChanged: false,
+      };
+      actionResults.push(actionRecord);
 
       if (!result.ok) {
         console.warn('[draft-web-for-1row] HWP action failed', {
@@ -630,6 +636,31 @@
 
       applied += 1;
       await sleep(CONFIG.apiFallbackDelayMs);
+
+      actionRecord.after = getHwpLayoutObservation(target.controller);
+      actionRecord.lineChanged = didHwpLineChange(actionRecord.before, actionRecord.after);
+
+      if (CONFIG.stopApiFallbackOnLineChange && actionRecord.lineChanged) {
+        const report = buildApiFallbackReport({
+          label,
+          target,
+          requestedPresses: presses,
+          applied,
+          actionResults,
+          startedAt,
+          stopReason: 'line-changed',
+        });
+        const beforeLabel = describeLineSignature(actionRecord.before);
+        const afterLabel = describeLineSignature(actionRecord.after);
+
+        publishApiFallbackReport(
+          report,
+          requestId,
+          `줄 변화 감지: ${beforeLabel} -> ${afterLabel}. HWP API ${applied}회에서 멈췄습니다.`,
+        );
+
+        return { applied: true, report, stoppedByLineChange: true };
+      }
     }
 
     const report = buildApiFallbackReport({
@@ -639,6 +670,7 @@
       applied,
       actionResults,
       startedAt,
+      stopReason: null,
     });
     const message = `HWP API로 자간 좁히기 ${applied}회 적용했습니다. DOM 줄 수는 확인하지 못했습니다.`;
 
@@ -648,9 +680,9 @@
   }
 
   function normalizePressCount(value, fallback) {
-    const numberValue = Number(value);
+    const numberValue = +value;
 
-    if (!Number.isFinite(numberValue)) {
+    if (!isFiniteNumber(numberValue)) {
       return fallback;
     }
 
@@ -666,10 +698,15 @@
     startedAt,
     stopped = false,
     failure = null,
+    stopReason = null,
   }) {
     const elapsedMs = Date.now() - startedAt;
     const okCount = actionResults.filter((result) => result.ok).length;
     const failCount = actionResults.length - okCount;
+    const observableCount = actionResults.filter((result) => {
+      return result.before && result.before.lineSignature && result.after && result.after.lineSignature;
+    }).length;
+    const lineChangedCount = actionResults.filter((result) => result.lineChanged).length;
     const avgMs = actionResults.length
       ? Math.round(actionResults.reduce((sum, result) => sum + result.elapsedMs, 0) / actionResults.length)
       : 0;
@@ -680,11 +717,16 @@
       `- 실패 횟수: ${failCount}`,
       `- 총 시간: ${elapsedMs}ms`,
       `- 액션 평균: ${avgMs}ms`,
+      `- 줄 관측 가능: ${observableCount}/${actionResults.length}`,
+      `- 줄 변화 감지: ${lineChangedCount}회`,
       `- 실행 경로: ${target.description.hasRun ? 'Run' : target.description.hasHActionRun ? 'HAction.Run' : 'CreateAction.Run'}`,
       `- 포커스 후보: ${target.description.hasFocus && !target.description.focusDelegatedToIframe ? 'Y' : 'N'}`,
       `- 중지됨: ${stopped ? 'Y' : 'N'}`,
+      `- 중지 사유: ${stopReason || 'none'}`,
       `- 실패 사유: ${failure || 'none'}`,
-      'DOM 줄 수는 확인하지 못합니다. 1회 버튼으로 적정 횟수를 빠르게 맞춰 보세요.',
+      CONFIG.stopApiFallbackOnLineChange
+        ? 'KeyIndicator 줄 값이 바뀌면 자동으로 멈춥니다. 관측 불가이면 설정 횟수만큼 실행합니다.'
+        : '자동 줄 변화 감지가 꺼져 있습니다. 설정 횟수만큼 실행합니다.',
     ];
     const data = {
       script: SOURCE,
@@ -695,7 +737,10 @@
       failCount,
       elapsedMs,
       avgActionMs: avgMs,
+      observableCount,
+      lineChangedCount,
       stopped,
+      stopReason,
       failure,
       target: target.description,
       actionResults,
@@ -722,6 +767,167 @@
     console.log(report.data);
     console.log(report.text);
     console.groupEnd();
+  }
+
+  function getHwpLayoutObservation(controller) {
+    const keyIndicator = readHwpKeyIndicator(controller);
+    const pos = readHwpPosition(controller, 'GetPos');
+    const selectedPos = readHwpPosition(controller, 'GetSelectedPos');
+    const lineSignature = buildHwpLineSignature(keyIndicator);
+
+    return {
+      available: Boolean(lineSignature),
+      lineSignature,
+      keyIndicator,
+      pos,
+      selectedPos,
+      collectedAtMs: Date.now(),
+    };
+  }
+
+  function readHwpKeyIndicator(controller) {
+    if (!controller || typeof controller.KeyIndicator !== 'function') {
+      return {
+        available: false,
+        reason: 'missing-KeyIndicator',
+      };
+    }
+
+    try {
+      const value = controller.KeyIndicator();
+      return normalizeKeyIndicatorValue(value);
+    } catch (error) {
+      return {
+        available: false,
+        reason: error.name || 'KeyIndicator-error',
+        message: String(error.message || error),
+      };
+    }
+  }
+
+  function normalizeKeyIndicatorValue(value) {
+    if (Array.isArray(value)) {
+      return {
+        available: true,
+        rawType: 'array',
+        seccnt: toMaybeNumber(value[0]),
+        secno: toMaybeNumber(value[1]),
+        prnpageno: toMaybeNumber(value[2]),
+        colno: toMaybeNumber(value[3]),
+        line: toMaybeNumber(value[4]),
+        pos: toMaybeNumber(value[5]),
+        over: toMaybeNumber(value[6]),
+        ctrlnameHash: value.length > 7 && value[7] ? hashString(String(value[7])) : null,
+        rawLength: value.length,
+      };
+    }
+
+    if (value && typeof value === 'object') {
+      return {
+        available: true,
+        rawType: 'object',
+        seccnt: firstNumericProperty(value, ['seccnt', 'SecCnt', 'sectionCount']),
+        secno: firstNumericProperty(value, ['secno', 'SecNo', 'section']),
+        prnpageno: firstNumericProperty(value, ['prnpageno', 'PrnPageNo', 'page', 'Page']),
+        colno: firstNumericProperty(value, ['colno', 'ColNo', 'column', 'Column']),
+        line: firstNumericProperty(value, ['line', 'Line']),
+        pos: firstNumericProperty(value, ['pos', 'Pos', 'working_pos', 'workingPos']),
+        over: firstNumericProperty(value, ['over', 'Over']),
+        ctrlnameHash: firstStringPropertyHash(value, ['ctrlname', 'CtrlName', 'ctrlName']),
+        keys: safeObjectKeys(value).slice(0, 12),
+      };
+    }
+
+    if (typeof value === 'string') {
+      return {
+        available: true,
+        rawType: 'string',
+        rawHash: hashString(value),
+        rawLength: value.length,
+      };
+    }
+
+    return {
+      available: false,
+      reason: `unsupported-return-${typeof value}`,
+    };
+  }
+
+  function readHwpPosition(controller, methodName) {
+    if (!controller || typeof controller[methodName] !== 'function') {
+      return {
+        available: false,
+        reason: `missing-${methodName}`,
+      };
+    }
+
+    try {
+      const value = controller[methodName]();
+      return normalizeHwpPositionValue(value);
+    } catch (error) {
+      return {
+        available: false,
+        reason: error.name || `${methodName}-error`,
+        message: String(error.message || error),
+      };
+    }
+  }
+
+  function normalizeHwpPositionValue(value) {
+    if (Array.isArray(value)) {
+      return {
+        available: true,
+        rawType: 'array',
+        list: toMaybeNumber(value[0]),
+        para: toMaybeNumber(value[1]),
+        pos: toMaybeNumber(value[2]),
+        rawLength: value.length,
+      };
+    }
+
+    if (value && typeof value === 'object') {
+      return {
+        available: true,
+        rawType: 'object',
+        list: firstNumericProperty(value, ['list', 'List']),
+        para: firstNumericProperty(value, ['para', 'Para']),
+        pos: firstNumericProperty(value, ['pos', 'Pos']),
+        keys: safeObjectKeys(value).slice(0, 12),
+      };
+    }
+
+    return {
+      available: false,
+      reason: `unsupported-return-${typeof value}`,
+    };
+  }
+
+  function buildHwpLineSignature(keyIndicator) {
+    if (!keyIndicator || !keyIndicator.available || typeof keyIndicator.line !== 'number') {
+      return null;
+    }
+
+    return [
+      typeof keyIndicator.prnpageno === 'number' ? keyIndicator.prnpageno : '?',
+      typeof keyIndicator.colno === 'number' ? keyIndicator.colno : '?',
+      keyIndicator.line,
+    ].join(':');
+  }
+
+  function didHwpLineChange(before, after) {
+    if (!before || !after || !before.lineSignature || !after.lineSignature) {
+      return false;
+    }
+
+    return before.lineSignature !== after.lineSignature;
+  }
+
+  function describeLineSignature(observation) {
+    if (!observation || !observation.lineSignature) {
+      return '관측 불가';
+    }
+
+    return observation.lineSignature;
   }
 
   function handleFrameMessage(event) {
@@ -1100,6 +1306,56 @@
     }
   }
 
+  function safeObjectKeys(value) {
+    try {
+      return Object.keys(value);
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  function firstNumericProperty(value, keys) {
+    for (let index = 0; index < keys.length; index += 1) {
+      const raw = safeProperty(value, keys[index]);
+      const numberValue = toMaybeNumber(raw);
+
+      if (typeof numberValue === 'number') {
+        return numberValue;
+      }
+    }
+
+    return null;
+  }
+
+  function firstStringPropertyHash(value, keys) {
+    for (let index = 0; index < keys.length; index += 1) {
+      const raw = safeProperty(value, keys[index]);
+
+      if (typeof raw === 'string' && raw) {
+        return hashString(raw);
+      }
+    }
+
+    return null;
+  }
+
+  function safeProperty(value, key) {
+    try {
+      return value[key];
+    } catch (_error) {
+      return undefined;
+    }
+  }
+
+  function toMaybeNumber(value) {
+    const numberValue = +value;
+    return isFiniteNumber(numberValue) ? numberValue : null;
+  }
+
+  function isFiniteNumber(value) {
+    return typeof value === 'number' && value === value && value !== Infinity && value !== -Infinity;
+  }
+
   function getPotentialHwpElements(doc) {
     try {
       return Array.from(doc.querySelectorAll('object, embed, applet, [id], [name]')).filter((element) => {
@@ -1178,6 +1434,7 @@
 
   function describeHwpControllerCandidate(candidate) {
     const value = candidate.value;
+    const layoutObservation = getHwpLayoutObservation(value);
 
     return {
       source: candidate.meta.source,
@@ -1185,10 +1442,16 @@
       hasRun: Boolean(value && typeof value.Run === 'function'),
       hasHActionRun: Boolean(value && value.HAction && typeof value.HAction.Run === 'function'),
       hasCreateAction: Boolean(value && typeof value.CreateAction === 'function'),
+      hasKeyIndicator: Boolean(value && typeof value.KeyIndicator === 'function'),
       hasHParameterSet: Boolean(value && value.HParameterSet),
       hasHwpCtrl: Boolean(value && (value.HwpCtrl || value.hwpCtrl)),
       hasFocus: safeDocumentHasFocus(candidate.meta.win.document),
       focusDelegatedToIframe: isFocusDelegatingToChildFrame(candidate.meta.win),
+      layoutObservable: Boolean(layoutObservation.lineSignature),
+      lineSignature: layoutObservation.lineSignature,
+      keyIndicatorReason: layoutObservation.keyIndicator && layoutObservation.keyIndicator.reason
+        ? layoutObservation.keyIndicator.reason
+        : null,
     };
   }
 
@@ -1628,6 +1891,10 @@
       const candidates = snapshot && Array.isArray(snapshot.hwpControllerCandidates) ? snapshot.hwpControllerCandidates : [];
       return sum + candidates.filter((candidate) => candidate.hasFocus && !candidate.focusDelegatedToIframe).length;
     }, 0);
+    const layoutObservableHwpTotal = allSnapshots.reduce((sum, snapshot) => {
+      const candidates = snapshot && Array.isArray(snapshot.hwpControllerCandidates) ? snapshot.hwpControllerCandidates : [];
+      return sum + candidates.filter((candidate) => candidate.layoutObservable).length;
+    }, 0);
     const surfaceTotals = sumSurfaceCounts(allSnapshots);
     const hints = buildDiagnosticHints({
       topFrameCount,
@@ -1641,6 +1908,7 @@
       contentEditableTotal,
       hwpControllerTotal,
       focusedHwpControllerTotal,
+      layoutObservableHwpTotal,
       surfaceTotals,
     });
 
@@ -1654,6 +1922,7 @@
       `- 같은 출처 접근 가능 iframe: ${accessibleDirectFrames}/${directFrames.length}개`,
       `- contenteditable 후보: ${contentEditableTotal}개`,
       `- HWP API 후보: ${hwpControllerTotal}개 (포커스 후보 ${focusedHwpControllerTotal}개)`,
+      `- HWP 줄 관측 후보: ${layoutObservableHwpTotal}개`,
       `- 렌더링 표면: canvas ${surfaceTotals.canvas}, object ${surfaceTotals.object}, embed ${surfaceTotals.embed}, HWP 이름 요소 ${surfaceTotals.hwpNamedElements}`,
       ...hints.map((hint) => `- ${hint}`),
       '상세 JSON은 콘솔에 기록했습니다. 필요하면 복사 버튼을 누르세요.',
@@ -1677,6 +1946,7 @@
         contentEditableTotal,
         hwpControllerTotal,
         focusedHwpControllerTotal,
+        layoutObservableHwpTotal,
         surfaceTotals,
       },
       hints,
@@ -1712,6 +1982,12 @@
 
     if (info.focusedHwpControllerTotal > 0) {
       hints.push('포커스된 HWP API 후보가 있습니다. 한 줄 줄이기 버튼이 API fallback을 시도합니다.');
+    }
+
+    if (info.layoutObservableHwpTotal > 0) {
+      hints.push('HWP 줄 관측 후보가 있습니다. API fallback은 줄 번호가 바뀌면 자동으로 멈춥니다.');
+    } else if (info.hwpControllerTotal > 0) {
+      hints.push('HWP API 후보는 있지만 줄 관측 후보가 없습니다. 이 경우 설정 횟수만큼 실행합니다.');
     }
 
     if (info.rememberedSelectionCount > 0 && info.currentSelectionCount === 0) {
