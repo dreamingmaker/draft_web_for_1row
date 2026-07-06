@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.6.0
+// @version      0.7.0
 // @description  Selected text in a web draft editor is tightened with Alt+Shift+N until it visually uses one fewer line.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.6.0';
+  const SCRIPT_VERSION = '0.7.0';
 
   const CONFIG = {
     maxPresses: 60,
@@ -592,7 +592,9 @@
         return { applied: applied > 0, report };
       }
 
-      const beforeObservation = getHwpLayoutObservation(target.controller);
+      const beforeObservation = getHwpLayoutObservation(target.controller, {
+        includeSelectionSpan: true,
+      });
       const actionStartedAt = Date.now();
       const result = runHwpAction(target.controller, 'CharShapeSpacingDecrease');
       const actionRecord = {
@@ -637,7 +639,9 @@
       applied += 1;
       await sleep(CONFIG.apiFallbackDelayMs);
 
-      actionRecord.after = getHwpLayoutObservation(target.controller);
+      actionRecord.after = getHwpLayoutObservation(target.controller, {
+        includeSelectionSpan: true,
+      });
       actionRecord.lineChanged = didHwpLineChange(actionRecord.before, actionRecord.after);
 
       if (CONFIG.stopApiFallbackOnLineChange && actionRecord.lineChanged) {
@@ -707,6 +711,9 @@
       return result.before && result.before.lineSignature && result.after && result.after.lineSignature;
     }).length;
     const lineChangedCount = actionResults.filter((result) => result.lineChanged).length;
+    const selectionSpanObservableCount = actionResults.filter((result) => {
+      return result.before && result.before.lineSignatureSource === 'selection-span';
+    }).length;
     const avgMs = actionResults.length
       ? Math.round(actionResults.reduce((sum, result) => sum + result.elapsedMs, 0) / actionResults.length)
       : 0;
@@ -718,6 +725,7 @@
       `- 총 시간: ${elapsedMs}ms`,
       `- 액션 평균: ${avgMs}ms`,
       `- 줄 관측 가능: ${observableCount}/${actionResults.length}`,
+      `- 선택 범위 관측: ${selectionSpanObservableCount}/${actionResults.length}`,
       `- 줄 변화 감지: ${lineChangedCount}회`,
       `- 실행 경로: ${target.description.hasRun ? 'Run' : target.description.hasHActionRun ? 'HAction.Run' : 'CreateAction.Run'}`,
       `- 포커스 후보: ${target.description.hasFocus && !target.description.focusDelegatedToIframe ? 'Y' : 'N'}`,
@@ -738,6 +746,7 @@
       elapsedMs,
       avgActionMs: avgMs,
       observableCount,
+      selectionSpanObservableCount,
       lineChangedCount,
       stopped,
       stopReason,
@@ -769,18 +778,28 @@
     console.groupEnd();
   }
 
-  function getHwpLayoutObservation(controller) {
+  function getHwpLayoutObservation(controller, options = {}) {
     const keyIndicator = readHwpKeyIndicator(controller);
     const pos = readHwpPosition(controller, 'GetPos');
     const selectedPos = readHwpPosition(controller, 'GetSelectedPos');
-    const lineSignature = buildHwpLineSignature(keyIndicator);
+    const cursorLineSignature = buildHwpLineSignature(keyIndicator);
+    const selectionSpan = options.includeSelectionSpan
+      ? readHwpSelectionLineSpan(controller, selectedPos)
+      : {
+        available: false,
+        reason: 'selection-span-probe-disabled',
+      };
+    const lineSignature = selectionSpan.spanSignature || cursorLineSignature;
 
     return {
       available: Boolean(lineSignature),
       lineSignature,
+      cursorLineSignature,
+      lineSignatureSource: selectionSpan.spanSignature ? 'selection-span' : 'cursor',
       keyIndicator,
       pos,
       selectedPos,
+      selectionSpan,
       collectedAtMs: Date.now(),
     };
   }
@@ -886,12 +905,28 @@
     }
 
     if (value && typeof value === 'object') {
+      const slist = firstNumericProperty(value, ['slist', 'SList']);
+      const spara = firstNumericProperty(value, ['spara', 'SPara']);
+      const spos = firstNumericProperty(value, ['spos', 'SPos']);
+      const elist = firstNumericProperty(value, ['elist', 'EList']);
+      const epara = firstNumericProperty(value, ['epara', 'EPara']);
+      const epos = firstNumericProperty(value, ['epos', 'EPos']);
+
       return {
         available: true,
         rawType: 'object',
         list: firstNumericProperty(value, ['list', 'List']),
         para: firstNumericProperty(value, ['para', 'Para']),
         pos: firstNumericProperty(value, ['pos', 'Pos']),
+        slist,
+        spara,
+        spos,
+        elist,
+        epara,
+        epos,
+        hasSelectionRange: hasNumericPositionTriplet(slist, spara, spos)
+          && hasNumericPositionTriplet(elist, epara, epos)
+          && `${slist}:${spara}:${spos}` !== `${elist}:${epara}:${epos}`,
         keys: safeObjectKeys(value).slice(0, 12),
       };
     }
@@ -912,6 +947,123 @@
       typeof keyIndicator.colno === 'number' ? keyIndicator.colno : '?',
       keyIndicator.line,
     ].join(':');
+  }
+
+  function readHwpSelectionLineSpan(controller, selectedPos) {
+    if (!selectedPos || !selectedPos.available || !selectedPos.hasSelectionRange) {
+      return {
+        available: false,
+        reason: 'missing-selected-range',
+      };
+    }
+
+    if (!controller || typeof controller.SetPos !== 'function') {
+      return {
+        available: false,
+        reason: 'missing-SetPos',
+      };
+    }
+
+    const start = {
+      list: selectedPos.slist,
+      para: selectedPos.spara,
+      pos: selectedPos.spos,
+    };
+    const end = {
+      list: selectedPos.elist,
+      para: selectedPos.epara,
+      pos: selectedPos.epos,
+    };
+    const startLine = readHwpLineAtPosition(controller, start);
+    const endLine = readHwpLineAtPosition(controller, end);
+    const restore = restoreHwpSelection(controller, selectedPos);
+
+    if (!startLine.lineSignature || !endLine.lineSignature) {
+      return {
+        available: false,
+        reason: 'line-read-failed',
+        start,
+        end,
+        startLine,
+        endLine,
+        restore,
+      };
+    }
+
+    return {
+      available: true,
+      start,
+      end,
+      startLine,
+      endLine,
+      restore,
+      spanSignature: `${startLine.lineSignature}->${endLine.lineSignature}`,
+    };
+  }
+
+  function readHwpLineAtPosition(controller, position) {
+    if (!hasNumericPositionTriplet(position.list, position.para, position.pos)) {
+      return {
+        available: false,
+        reason: 'invalid-position',
+      };
+    }
+
+    try {
+      controller.SetPos(position.list, position.para, position.pos);
+    } catch (error) {
+      return {
+        available: false,
+        reason: error.name || 'SetPos-error',
+        message: String(error.message || error),
+      };
+    }
+
+    const keyIndicator = readHwpKeyIndicator(controller);
+
+    return {
+      available: Boolean(buildHwpLineSignature(keyIndicator)),
+      lineSignature: buildHwpLineSignature(keyIndicator),
+      keyIndicator,
+    };
+  }
+
+  function restoreHwpSelection(controller, selectedPos) {
+    if (!controller || typeof controller.SelectText !== 'function') {
+      return {
+        ok: false,
+        reason: 'missing-SelectText',
+      };
+    }
+
+    try {
+      return {
+        ok: true,
+        via: 'SelectText4',
+        value: controller.SelectText(selectedPos.spara, selectedPos.spos, selectedPos.epara, selectedPos.epos),
+      };
+    } catch (firstError) {
+      try {
+        return {
+          ok: true,
+          via: 'SelectText6',
+          value: controller.SelectText(
+            selectedPos.slist,
+            selectedPos.spara,
+            selectedPos.spos,
+            selectedPos.elist,
+            selectedPos.epara,
+            selectedPos.epos,
+          ),
+        };
+      } catch (secondError) {
+        return {
+          ok: false,
+          reason: secondError.name || firstError.name || 'SelectText-error',
+          message: String(secondError.message || firstError.message || secondError || firstError),
+        };
+      }
+    }
   }
 
   function didHwpLineChange(before, after) {
@@ -1337,6 +1489,10 @@
     }
 
     return null;
+  }
+
+  function hasNumericPositionTriplet(list, para, pos) {
+    return typeof list === 'number' && typeof para === 'number' && typeof pos === 'number';
   }
 
   function safeProperty(value, key) {
