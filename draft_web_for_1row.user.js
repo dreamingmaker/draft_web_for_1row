@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.8.4
+// @version      0.9.0
 // @description  Adds fixed HWP letter-spacing buttons for selected text in a web draft editor.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.4';
+  const SCRIPT_VERSION = '0.9.0';
 
   const CONFIG = {
     maxPresses: 60,
@@ -28,6 +28,7 @@
     apiDebugPresses: 1,
     apiFallbackDelayMs: 70,
     stopApiFallbackOnLineChange: true,
+    applyWordBreakBeforeSpacing: true,
     minRectWidth: 1,
     minRectHeight: 1,
     lineTolerancePx: 2,
@@ -124,6 +125,15 @@
         background: #14532d;
       }
 
+      #${UI_ID} button.word-break {
+        min-width: 106px;
+        background: #374151;
+      }
+
+      #${UI_ID} button.word-break:hover {
+        background: #1f2937;
+      }
+
       #${UI_ID} button[data-running="true"] {
         background: #9f1239;
       }
@@ -180,11 +190,17 @@
     increaseButton.textContent = '2칸 늘리기';
     increaseButton.title = '선택한 텍스트의 자간을 2칸 넓힙니다.';
 
+    const wordBreakButton = document.createElement('button');
+    wordBreakButton.type = 'button';
+    wordBreakButton.className = 'word-break';
+    wordBreakButton.textContent = '어절 줄나눔';
+    wordBreakButton.title = '선택 문단의 한글 줄 나눔 기준을 어절로 바꿉니다.';
+
     const debug = document.createElement('pre');
     debug.className = 'debug';
     debug.hidden = true;
 
-    actions.append(runButton, increaseButton);
+    actions.append(runButton, increaseButton, wordBreakButton);
 
     panel.append(status, actions, debug);
     document.documentElement.append(style, panel);
@@ -244,6 +260,30 @@
         increaseButton.textContent = '2칸 늘리기';
       }
     });
+
+    wordBreakButton.addEventListener('click', async () => {
+      if (running) {
+        requestAbort();
+        return;
+      }
+
+      running = true;
+      abortRequested = false;
+      wordBreakButton.dataset.running = 'true';
+      wordBreakButton.textContent = '적용중';
+
+      try {
+        await runHwpWordBreakAction({
+          label: '어절 줄나눔',
+        });
+      } finally {
+        running = false;
+        abortRequested = false;
+        currentRequestId = null;
+        wordBreakButton.dataset.running = 'false';
+        wordBreakButton.textContent = '어절 줄나눔';
+      }
+    });
   }
 
   function requestAbort() {
@@ -264,6 +304,14 @@
 
     clearDebug();
     setStatus(`${label} 실행 중...`);
+
+    if (CONFIG.applyWordBreakBeforeSpacing) {
+      await applyHwpWordBreakAction(requestId, {
+        includeReachableFrames: true,
+        silentReport: true,
+        label: `${label} 전 어절 줄나눔`,
+      });
+    }
 
     const result = await applyHwpApiFallback(requestId, {
       includeReachableFrames: true,
@@ -288,6 +336,102 @@
       clearDebug();
       console.warn('[draft-web-for-1row] fixed HWP spacing action failed', result);
     }
+  }
+
+  async function runHwpWordBreakAction({ label }) {
+    const requestId = createRequestId();
+    currentRequestId = requestId;
+
+    clearDebug();
+    setStatus(`${label} 적용 중...`);
+
+    const result = await applyHwpWordBreakAction(requestId, {
+      includeReachableFrames: true,
+      silentReport: true,
+      label,
+    });
+
+    if (!result.applied) {
+      const text = [
+        `${label} 실패`,
+        `- 이유: ${result.reason || 'candidate-not-found'}`,
+        '- HWP ParagraphShape API 후보를 찾지 못했거나 실행이 실패했습니다.',
+      ].join('\n');
+
+      lastDiagnosticText = text;
+      setStatus(`${label} 실패`);
+      clearDebug();
+      console.warn('[draft-web-for-1row] HWP word-break action failed', result);
+    }
+  }
+
+  async function applyHwpWordBreakAction(requestId, options = {}) {
+    const target = findBestHwpActionTarget(options);
+    const label = options.label || '어절 줄나눔';
+    const startedAt = Date.now();
+
+    if (!target) {
+      return {
+        applied: false,
+        reason: 'candidate-not-found',
+      };
+    }
+
+    const result = runHwpParagraphWordBreakAction(target.controller);
+    const report = {
+      script: SOURCE,
+      version: SCRIPT_VERSION,
+      label,
+      actionId: 'ParagraphShape',
+      parameter: {
+        BreakNonLatinWord: 0,
+      },
+      parameterMeaning: '0 = 어절, 1 = 글자',
+      elapsedMs: Date.now() - startedAt,
+      ok: result.ok,
+      via: result.via || null,
+      reason: result.reason || null,
+      target: target.description,
+      collectedAt: new Date().toISOString(),
+    };
+
+    if (!result.ok) {
+      if (!options.silentReport) {
+        lastDiagnosticText = JSON.stringify(report, null, 2);
+        setStatus(`${label} 실패`, {
+          requestId,
+          found: true,
+          terminal: true,
+        });
+      }
+
+      console.warn('[draft-web-for-1row] HWP paragraph word-break action failed', {
+        result,
+        report,
+      });
+
+      return {
+        applied: false,
+        reason: result.reason,
+        report,
+      };
+    }
+
+    setStatus(`${label} 적용`, {
+      requestId,
+      found: true,
+      terminal: true,
+    });
+    clearDebug();
+
+    console.groupCollapsed('[draft-web-for-1row] HWP paragraph word-break action report');
+    console.log(report);
+    console.groupEnd();
+
+    return {
+      applied: true,
+      report,
+    };
   }
 
   function requestOneLineFromAllFrames() {
@@ -1637,6 +1781,154 @@
         ok: false,
         reason: error.name || 'action-error',
         message: String(error.message || error),
+      };
+    }
+  }
+
+  function runHwpParagraphWordBreakAction(controller) {
+    const failures = [];
+
+    try {
+      if (controller && typeof controller.CreateAction === 'function') {
+        const action = controller.CreateAction('ParagraphShape');
+
+        if (action && typeof action.CreateSet === 'function' && typeof action.Execute === 'function') {
+          const set = action.CreateSet();
+
+          if (action && typeof action.GetDefault === 'function') {
+            action.GetDefault(set);
+          }
+
+          const setResult = setHwpSetItem(set, 'BreakNonLatinWord', 0);
+
+          if (!setResult.ok) {
+            failures.push(`CreateAction.SetItem:${setResult.reason}`);
+          } else {
+            const value = action.Execute(set);
+
+            if (value === false) {
+              failures.push('CreateAction.Execute-returned-false');
+            } else {
+              return {
+                ok: true,
+                via: `CreateAction.Execute:${setResult.via}`,
+                value,
+              };
+            }
+          }
+        } else {
+          failures.push('CreateAction-missing-CreateSet-or-Execute');
+        }
+      } else {
+        failures.push('missing-CreateAction');
+      }
+    } catch (error) {
+      failures.push(`CreateAction-error:${error.name || error}`);
+    }
+
+    try {
+      const hAction = controller && controller.HAction;
+      const parameterSet = controller && controller.HParameterSet;
+      const paraShape = parameterSet && (parameterSet.HParaShape || parameterSet.ParaShape);
+      const hSet = paraShape && (paraShape.HSet || paraShape);
+
+      if (hAction && typeof hAction.GetDefault === 'function' && typeof hAction.Execute === 'function' && hSet) {
+        hAction.GetDefault('ParagraphShape', hSet);
+
+        const setResult = setHwpParaShapeItem(paraShape, hSet, 'BreakNonLatinWord', 0);
+
+        if (!setResult.ok) {
+          failures.push(`HAction.SetItem:${setResult.reason}`);
+        } else {
+          const value = hAction.Execute('ParagraphShape', hSet);
+
+          if (value === false) {
+            failures.push('HAction.Execute-returned-false');
+          } else {
+            return {
+              ok: true,
+              via: `HAction.Execute:${setResult.via}`,
+              value,
+            };
+          }
+        }
+      } else {
+        failures.push('missing-HAction-GetDefault-Execute-or-HSet');
+      }
+    } catch (error) {
+      failures.push(`HAction-error:${error.name || error}`);
+    }
+
+    return {
+      ok: false,
+      reason: failures.join('|') || 'paragraph-word-break-unavailable',
+    };
+  }
+
+  function setHwpParaShapeItem(paraShape, hSet, key, value) {
+    const applied = [];
+
+    if (paraShape) {
+      try {
+        paraShape[key] = value;
+        applied.push('property');
+      } catch (_error) {
+        // Continue with HSet.SetItem if direct property assignment is blocked.
+      }
+    }
+
+    const setResult = setHwpSetItem(hSet, key, value);
+
+    if (setResult.ok) {
+      applied.push(setResult.via);
+    }
+
+    if (!applied.length) {
+      return {
+        ok: false,
+        reason: setResult.reason || 'set-item-failed',
+      };
+    }
+
+    return {
+      ok: true,
+      via: applied.join('+'),
+    };
+  }
+
+  function setHwpSetItem(set, key, value) {
+    if (!set) {
+      return {
+        ok: false,
+        reason: 'missing-set',
+      };
+    }
+
+    try {
+      if (typeof set.SetItem === 'function') {
+        set.SetItem(key, value);
+        return {
+          ok: true,
+          via: 'SetItem',
+        };
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error.name || 'SetItem-error',
+      };
+    }
+
+    try {
+      set[key] = value;
+      return {
+        ok: true,
+        via: 'property',
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error.name || 'property-set-error',
       };
     }
   }
