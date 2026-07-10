@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Draft: 1 Line Maker
 // @namespace    local.draft-web-for-1row
-// @version      0.9.0
+// @version      0.9.1
 // @description  Adds fixed HWP letter-spacing buttons for selected text in a web draft editor.
 // @match        *://*/*
 // @include      about:blank
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.9.0';
+  const SCRIPT_VERSION = '0.9.1';
 
   const CONFIG = {
     maxPresses: 60,
@@ -391,6 +391,9 @@
       ok: result.ok,
       via: result.via || null,
       reason: result.reason || null,
+      before: result.before || null,
+      after: result.after || null,
+      attempts: result.attempts || [],
       target: target.description,
       collectedAt: new Date().toISOString(),
     };
@@ -1786,83 +1789,266 @@
   }
 
   function runHwpParagraphWordBreakAction(controller) {
-    const failures = [];
+    const before = readHwpParagraphWordBreakValue(controller);
+    const attempts = [
+      executeCreateActionParagraphWordBreak(controller),
+      executeHActionParagraphWordBreak(controller),
+    ];
+    const after = readHwpParagraphWordBreakValue(controller);
+    const successes = attempts.filter((attempt) => attempt.ok);
 
-    try {
-      if (controller && typeof controller.CreateAction === 'function') {
-        const action = controller.CreateAction('ParagraphShape');
-
-        if (action && typeof action.CreateSet === 'function' && typeof action.Execute === 'function') {
-          const set = action.CreateSet();
-
-          if (action && typeof action.GetDefault === 'function') {
-            action.GetDefault(set);
-          }
-
-          const setResult = setHwpSetItem(set, 'BreakNonLatinWord', 0);
-
-          if (!setResult.ok) {
-            failures.push(`CreateAction.SetItem:${setResult.reason}`);
-          } else {
-            const value = action.Execute(set);
-
-            if (value === false) {
-              failures.push('CreateAction.Execute-returned-false');
-            } else {
-              return {
-                ok: true,
-                via: `CreateAction.Execute:${setResult.via}`,
-                value,
-              };
-            }
-          }
-        } else {
-          failures.push('CreateAction-missing-CreateSet-or-Execute');
-        }
-      } else {
-        failures.push('missing-CreateAction');
-      }
-    } catch (error) {
-      failures.push(`CreateAction-error:${error.name || error}`);
+    if (successes.length) {
+      return {
+        ok: true,
+        via: successes.map((attempt) => attempt.via).join('+'),
+        value: successes.map((attempt) => attempt.value),
+        before,
+        after,
+        attempts,
+      };
     }
 
+    return {
+      ok: false,
+      reason: attempts.map((attempt) => attempt.reason).filter(Boolean).join('|') || 'paragraph-word-break-unavailable',
+      before,
+      after,
+      attempts,
+    };
+  }
+
+  function executeCreateActionParagraphWordBreak(controller) {
+    try {
+      if (!controller || typeof controller.CreateAction !== 'function') {
+        return {
+          ok: false,
+          via: 'CreateAction',
+          reason: 'missing-CreateAction',
+        };
+      }
+
+      const action = controller.CreateAction('ParagraphShape');
+
+      if (!action || typeof action.CreateSet !== 'function' || typeof action.Execute !== 'function') {
+        return {
+          ok: false,
+          via: 'CreateAction',
+          reason: 'missing-CreateSet-or-Execute',
+        };
+      }
+
+      const set = action.CreateSet();
+
+      if (typeof action.GetDefault === 'function') {
+        action.GetDefault(set);
+      }
+
+      const setResult = setHwpSetItem(set, 'BreakNonLatinWord', 0);
+
+      if (!setResult.ok) {
+        return {
+          ok: false,
+          via: 'CreateAction',
+          reason: `SetItem:${setResult.reason}`,
+        };
+      }
+
+      const value = action.Execute(set);
+
+      if (value === false) {
+        return {
+          ok: false,
+          via: 'CreateAction',
+          reason: 'Execute-returned-false',
+          value,
+        };
+      }
+
+      return {
+        ok: true,
+        via: `CreateAction.Execute:${setResult.via}`,
+        value,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        via: 'CreateAction',
+        reason: error.name || 'CreateAction-error',
+        message: String(error.message || error),
+      };
+    }
+  }
+
+  function executeHActionParagraphWordBreak(controller) {
     try {
       const hAction = controller && controller.HAction;
       const parameterSet = controller && controller.HParameterSet;
       const paraShape = parameterSet && (parameterSet.HParaShape || parameterSet.ParaShape);
       const hSet = paraShape && (paraShape.HSet || paraShape);
 
-      if (hAction && typeof hAction.GetDefault === 'function' && typeof hAction.Execute === 'function' && hSet) {
-        hAction.GetDefault('ParagraphShape', hSet);
-
-        const setResult = setHwpParaShapeItem(paraShape, hSet, 'BreakNonLatinWord', 0);
-
-        if (!setResult.ok) {
-          failures.push(`HAction.SetItem:${setResult.reason}`);
-        } else {
-          const value = hAction.Execute('ParagraphShape', hSet);
-
-          if (value === false) {
-            failures.push('HAction.Execute-returned-false');
-          } else {
-            return {
-              ok: true,
-              via: `HAction.Execute:${setResult.via}`,
-              value,
-            };
-          }
-        }
-      } else {
-        failures.push('missing-HAction-GetDefault-Execute-or-HSet');
+      if (!hAction || typeof hAction.GetDefault !== 'function' || typeof hAction.Execute !== 'function' || !hSet) {
+        return {
+          ok: false,
+          via: 'HAction',
+          reason: 'missing-GetDefault-Execute-or-HSet',
+        };
       }
+
+      hAction.GetDefault('ParagraphShape', hSet);
+
+      const setResult = setHwpParaShapeItem(paraShape, hSet, 'BreakNonLatinWord', 0);
+
+      if (!setResult.ok) {
+        return {
+          ok: false,
+          via: 'HAction',
+          reason: `SetItem:${setResult.reason}`,
+        };
+      }
+
+      const value = hAction.Execute('ParagraphShape', hSet);
+
+      if (value === false) {
+        return {
+          ok: false,
+          via: 'HAction',
+          reason: 'Execute-returned-false',
+          value,
+        };
+      }
+
+      return {
+        ok: true,
+        via: `HAction.Execute:${setResult.via}`,
+        value,
+      };
     } catch (error) {
-      failures.push(`HAction-error:${error.name || error}`);
+      return {
+        ok: false,
+        via: 'HAction',
+        reason: error.name || 'HAction-error',
+        message: String(error.message || error),
+      };
+    }
+  }
+
+  function readHwpParagraphWordBreakValue(controller) {
+    const createActionValue = readHwpParagraphWordBreakValueByCreateAction(controller);
+
+    if (createActionValue.available) {
+      return createActionValue;
+    }
+
+    const hActionValue = readHwpParagraphWordBreakValueByHAction(controller);
+
+    if (hActionValue.available) {
+      return hActionValue;
     }
 
     return {
-      ok: false,
-      reason: failures.join('|') || 'paragraph-word-break-unavailable',
+      available: false,
+      reason: [createActionValue.reason, hActionValue.reason].filter(Boolean).join('|') || 'unavailable',
     };
+  }
+
+  function readHwpParagraphWordBreakValueByCreateAction(controller) {
+    try {
+      if (!controller || typeof controller.CreateAction !== 'function') {
+        return {
+          available: false,
+          via: 'CreateAction',
+          reason: 'missing-CreateAction',
+        };
+      }
+
+      const action = controller.CreateAction('ParagraphShape');
+
+      if (!action || typeof action.CreateSet !== 'function' || typeof action.GetDefault !== 'function') {
+        return {
+          available: false,
+          via: 'CreateAction',
+          reason: 'missing-CreateSet-or-GetDefault',
+        };
+      }
+
+      const set = action.CreateSet();
+      action.GetDefault(set);
+
+      const item = getHwpSetItem(set, 'BreakNonLatinWord');
+
+      if (!item.available) {
+        return {
+          available: false,
+          via: 'CreateAction',
+          reason: item.reason,
+        };
+      }
+
+      return {
+        available: true,
+        via: `CreateAction.GetDefault:${item.via}`,
+        value: item.value,
+      };
+    } catch (error) {
+      return {
+        available: false,
+        via: 'CreateAction',
+        reason: error.name || 'CreateAction-read-error',
+        message: String(error.message || error),
+      };
+    }
+  }
+
+  function readHwpParagraphWordBreakValueByHAction(controller) {
+    try {
+      const hAction = controller && controller.HAction;
+      const parameterSet = controller && controller.HParameterSet;
+      const paraShape = parameterSet && (parameterSet.HParaShape || parameterSet.ParaShape);
+      const hSet = paraShape && (paraShape.HSet || paraShape);
+
+      if (!hAction || typeof hAction.GetDefault !== 'function' || !hSet) {
+        return {
+          available: false,
+          via: 'HAction',
+          reason: 'missing-GetDefault-or-HSet',
+        };
+      }
+
+      hAction.GetDefault('ParagraphShape', hSet);
+
+      const item = getHwpSetItem(paraShape, 'BreakNonLatinWord');
+
+      if (item.available) {
+        return {
+          available: true,
+          via: `HAction.GetDefault:property:${item.via}`,
+          value: item.value,
+        };
+      }
+
+      const hSetItem = getHwpSetItem(hSet, 'BreakNonLatinWord');
+
+      if (hSetItem.available) {
+        return {
+          available: true,
+          via: `HAction.GetDefault:HSet:${hSetItem.via}`,
+          value: hSetItem.value,
+        };
+      }
+
+      return {
+        available: false,
+        via: 'HAction',
+        reason: [item.reason, hSetItem.reason].filter(Boolean).join('|') || 'missing-value',
+      };
+    } catch (error) {
+      return {
+        available: false,
+        via: 'HAction',
+        reason: error.name || 'HAction-read-error',
+        message: String(error.message || error),
+      };
+    }
   }
 
   function setHwpParaShapeItem(paraShape, hSet, key, value) {
@@ -1929,6 +2115,52 @@
       return {
         ok: false,
         reason: error.name || 'property-set-error',
+      };
+    }
+  }
+
+  function getHwpSetItem(set, key) {
+    if (!set) {
+      return {
+        available: false,
+        reason: 'missing-set',
+      };
+    }
+
+    try {
+      if (typeof set.GetItem === 'function') {
+        return {
+          available: true,
+          via: 'GetItem',
+          value: set.GetItem(key),
+        };
+      }
+    } catch (error) {
+      return {
+        available: false,
+        reason: error.name || 'GetItem-error',
+      };
+    }
+
+    try {
+      const value = set[key];
+
+      if (value !== undefined) {
+        return {
+          available: true,
+          via: 'property',
+          value,
+        };
+      }
+
+      return {
+        available: false,
+        reason: 'undefined-property',
+      };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error.name || 'property-read-error',
       };
     }
   }
